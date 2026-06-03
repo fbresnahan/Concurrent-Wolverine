@@ -243,6 +243,16 @@ template <typename dist_t>
 double deleteIndex(hnswlib::HierarchicalNSW<dist_t>* alg_hnsw,vector<size_t> deleteList,int delete_model,int num_threads,int newLinkSize){
     struct timeval delete_start_time,delete_end_time;
     double delete_time=0;
+    if (delete_model == TWOHOP_DELETE ||
+        delete_model == APPROXIMATE_TWOHOP_DELETE) {
+        gettimeofday(&delete_start_time,NULL);
+        for (size_t row = 0; row < deleteList.size(); row++) {
+            alg_hnsw->deletePointConcurrent(deleteList[row], delete_model, newLinkSize);
+        }
+        gettimeofday(&delete_end_time,NULL);
+        delete_time=(double)(delete_end_time.tv_sec-delete_start_time.tv_sec)+(double)(delete_end_time.tv_usec-delete_start_time.tv_usec)/1000000;
+        return deleteList.size()/delete_time;
+    }
     #ifdef mulThreadsDelete
     gettimeofday(&delete_start_time,NULL);
     alg_hnsw->patchDelete(deleteList,delete_model,newLinkSize,num_threads);
@@ -263,6 +273,16 @@ template <typename dist_t>
 double deleteIndex(hnswlib::HierarchicalNSW<dist_t>* alg_hnsw,size_t deleteStart,size_t deleteLen,int delete_model,int num_threads,int newLinkSize){
     struct timeval delete_start_time,delete_end_time;
     double delete_time=0;
+    if (delete_model == TWOHOP_DELETE ||
+        delete_model == APPROXIMATE_TWOHOP_DELETE) {
+        gettimeofday(&delete_start_time,NULL);
+        for (size_t row = 0; row < deleteLen; row++) {
+            alg_hnsw->deletePointConcurrent(deleteStart + row, delete_model, newLinkSize);
+        }
+        gettimeofday(&delete_end_time,NULL);
+        delete_time+=(double)(delete_end_time.tv_sec-delete_start_time.tv_sec)+(double)(delete_end_time.tv_usec-delete_start_time.tv_usec)/1000000;
+        return deleteLen/delete_time;
+    }
     gettimeofday(&delete_start_time,NULL);
     alg_hnsw->patchDelete(deleteStart,deleteLen,delete_model,newLinkSize,num_threads);
     gettimeofday(&delete_end_time,NULL);

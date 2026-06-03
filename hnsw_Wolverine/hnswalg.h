@@ -10,6 +10,7 @@
 #include <list>
 #include <memory>
 #include <algorithm>
+#include <shared_mutex>
 #include <thread>
 #include <unordered_set>
 #include <omp.h>
@@ -46,8 +47,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     // Locks operations with element by label value
     mutable std::vector<std::mutex> label_op_locks_;
 
-    std::mutex global;
-    std::vector<std::mutex> link_list_locks_;
+    mutable std::shared_mutex metadata_lock_;
+    mutable std::vector<std::shared_mutex> link_list_locks_;
+    mutable std::shared_mutex reverse_links_lock_;
 
     tableint enterpoint_node_{0};
 
@@ -57,13 +59,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     char *data_level0_memory_{nullptr};
     char **linkLists_{nullptr};
     std::vector<int> element_levels_;  // keeps level of each element
+    std::vector<std::vector<std::vector<tableint>>> reverse_link_lists_;
 
     size_t data_size_{0};
 
     DISTFUNC<dist_t> fstdistfunc_;
     void *dist_func_param_{nullptr};
 
-    mutable std::mutex label_lookup_lock;  // lock for label_lookup_
+    mutable std::shared_mutex label_lookup_lock;  // lock for label_lookup_
     std::unordered_map<labeltype, tableint> label_lookup_;
 
     std::default_random_engine level_generator_;
@@ -107,6 +110,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         : label_op_locks_(MAX_LABEL_OPERATION_LOCKS),
             link_list_locks_(max_elements),
             element_levels_(max_elements),
+            reverse_link_lists_(max_elements, std::vector<std::vector<tableint>>(1)),
             allow_replace_deleted_(allow_replace_deleted) {
         max_elements_ = max_elements;
         num_deleted_ = 0;
@@ -173,6 +177,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         linkLists_ = nullptr;
         cur_element_count = 0;
         visited_list_pool_.reset(nullptr);
+        reverse_link_lists_.clear();
 
         free(deleteFlags);
     }
@@ -188,6 +193,162 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     void setEf(size_t ef) {
         ef_ = ef;
+    }
+
+    struct SearchMetadataSnapshot {
+        tableint enterpoint_node;
+        int maxlevel;
+    };
+
+    SearchMetadataSnapshot getSearchMetadataSnapshot() const {
+        std::shared_lock<std::shared_mutex> lock(metadata_lock_);
+        return {enterpoint_node_, maxlevel_};
+    }
+
+    tableint greedySearchUpperLayers(const void *query_data, SearchMetadataSnapshot metadata) const {
+        tableint currObj = metadata.enterpoint_node;
+        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(currObj), dist_func_param_);
+
+        for (int level = metadata.maxlevel; level > 0; level--) {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                std::vector<tableint> neighbors = getConnectionsWithSharedLock(currObj, level);
+                metric_hops++;
+                metric_distance_computations += neighbors.size();
+
+                for (tableint cand : neighbors) {
+                    if (cand < 0 || cand > max_elements_)
+                        throw std::runtime_error("cand error");
+                    dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
+
+                    if (d < curdist) {
+                        curdist = d;
+                        currObj = cand;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        return currObj;
+    }
+
+    std::vector<tableint> getConnectionsNoLock(tableint internalId, int level) const {
+        unsigned int *data = get_linklist_at_level(internalId, level);
+        int size = getListCount(data);
+        std::vector<tableint> result(size);
+        tableint *ll = (tableint *) (data + 1);
+        memcpy(result.data(), ll, size * sizeof(tableint));
+        return result;
+    }
+
+    std::vector<tableint> getConnectionsWithSharedLock(tableint internalId, int level) const {
+        std::shared_lock<std::shared_mutex> lock(link_list_locks_[internalId]);
+        return getConnectionsNoLock(internalId, level);
+    }
+
+    void ensureReverseLevelNoLock(tableint internalId, int level) {
+        if (reverse_link_lists_[internalId].size() <= static_cast<size_t>(level)) {
+            reverse_link_lists_[internalId].resize(level + 1);
+        }
+    }
+
+    std::vector<tableint> getReverseConnectionsNoLock(tableint internalId, int level) const {
+        if (reverse_link_lists_[internalId].size() <= static_cast<size_t>(level)) {
+            return {};
+        }
+        return reverse_link_lists_[internalId][level];
+    }
+
+    std::vector<tableint> getReverseConnectionsWithSharedLock(tableint internalId, int level) const {
+        std::shared_lock<std::shared_mutex> lock(reverse_links_lock_);
+        return getReverseConnectionsNoLock(internalId, level);
+    }
+
+    void addReverseLinkNoLock(tableint target, int level, tableint source) {
+        ensureReverseLevelNoLock(target, level);
+        std::vector<tableint> &reverse_neighbors = reverse_link_lists_[target][level];
+        if (find(reverse_neighbors.begin(), reverse_neighbors.end(), source) == reverse_neighbors.end()) {
+            reverse_neighbors.emplace_back(source);
+        }
+    }
+
+    void removeReverseLinkNoLock(tableint target, int level, tableint source) {
+        if (reverse_link_lists_[target].size() <= static_cast<size_t>(level)) {
+            return;
+        }
+        std::vector<tableint> &reverse_neighbors = reverse_link_lists_[target][level];
+        reverse_neighbors.erase(
+            std::remove(reverse_neighbors.begin(), reverse_neighbors.end(), source),
+            reverse_neighbors.end());
+    }
+
+    void syncReverseLinksForSourceNoLock(
+        tableint source,
+        int level,
+        const std::vector<tableint> &old_neighbors,
+        const std::vector<tableint> &new_neighbors) {
+        for (tableint old_neighbor : old_neighbors) {
+            if (find(new_neighbors.begin(), new_neighbors.end(), old_neighbor) == new_neighbors.end()) {
+                removeReverseLinkNoLock(old_neighbor, level, source);
+            }
+        }
+        for (tableint new_neighbor : new_neighbors) {
+            if (find(old_neighbors.begin(), old_neighbors.end(), new_neighbor) == old_neighbors.end()) {
+                addReverseLinkNoLock(new_neighbor, level, source);
+            }
+        }
+    }
+
+    void overwriteConnectionsNoLock(tableint internalId, int level, const std::vector<tableint> &neighbors) {
+        linklistsizeint *ll = get_linklist_at_level(internalId, level);
+        size_t max_neighbors = level ? maxM_ : maxM0_;
+        if (neighbors.size() > max_neighbors) {
+            throw std::runtime_error("Too many neighbors for level");
+        }
+
+        tableint *data = (tableint *) (ll + 1);
+        setListCount(ll, neighbors.size());
+        for (size_t idx = 0; idx < neighbors.size(); idx++) {
+            data[idx] = neighbors[idx];
+        }
+        for (size_t idx = neighbors.size(); idx < max_neighbors; idx++) {
+            data[idx] = 0;
+        }
+    }
+
+    void replaceConnectionsLocked(tableint internalId, int level, const std::vector<tableint> &neighbors) {
+        std::vector<tableint> old_neighbors = getConnectionsNoLock(internalId, level);
+        overwriteConnectionsNoLock(internalId, level, neighbors);
+        std::unique_lock<std::shared_mutex> reverse_lock(reverse_links_lock_);
+        syncReverseLinksForSourceNoLock(internalId, level, old_neighbors, neighbors);
+    }
+
+    void rebuildReverseAdjacency() {
+        std::vector<std::vector<std::vector<tableint>>> snapshots(cur_element_count);
+        for (tableint internalId = 0; internalId < cur_element_count; internalId++) {
+            snapshots[internalId].resize(element_levels_[internalId] + 1);
+            for (int level = 0; level <= element_levels_[internalId]; level++) {
+                snapshots[internalId][level] = getConnectionsWithSharedLock(internalId, level);
+            }
+        }
+
+        std::unique_lock<std::shared_mutex> reverse_lock(reverse_links_lock_);
+        reverse_link_lists_.assign(max_elements_, std::vector<std::vector<tableint>>(1));
+        for (tableint internalId = 0; internalId < cur_element_count; internalId++) {
+            reverse_link_lists_[internalId].resize(element_levels_[internalId] + 1);
+            for (int level = 0; level <= element_levels_[internalId]; level++) {
+                for (tableint neighbor : snapshots[internalId][level]) {
+                    addReverseLinkNoLock(neighbor, level, internalId);
+                }
+            }
+        }
+    }
+
+    bool isMarkedDeletedWithSharedLock(tableint internalId) const {
+        std::shared_lock<std::shared_mutex> lock(link_list_locks_[internalId]);
+        return isMarkedDeleted(internalId);
     }
 
 
@@ -268,7 +429,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
             tableint curNodeNum = curr_el_pair.second;
 
-            std::unique_lock <std::mutex> lock(link_list_locks_[curNodeNum]);
+            std::unique_lock<std::shared_mutex> lock(link_list_locks_[curNodeNum]);
 
             int *data;  // = (int *)(linkList0_ + curNodeNum * size_links_per_element0_);
             if (layer == 0) {
@@ -351,7 +512,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
             tableint curNodeNum = curr_el_pair.second;
 
-            std::unique_lock <std::mutex> lock(link_list_locks_[curNodeNum]);
+            std::unique_lock<std::shared_mutex> lock(link_list_locks_[curNodeNum]);
 
             int *data;  // = (int *)(linkList0_ + curNodeNum * size_links_per_element0_);
             if (layer == 0) {
@@ -420,8 +581,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
 
         dist_t lowerBound;
-        if (bare_bone_search || 
-            (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
+        if (bare_bone_search ||
+            (!isMarkedDeletedWithSharedLock(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
             char* ep_data = getDataByInternalId(ep_id);
             dist_t dist = fstdistfunc_(data_point, ep_data, dist_func_param_);
             lowerBound = dist;
@@ -457,29 +618,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             candidate_set.pop();
 
             tableint current_node_id = current_node_pair.second;
-            int *data = (int *) get_linklist0(current_node_id);
-            size_t size = getListCount((linklistsizeint*)data);
-//                bool cur_node_deleted = isMarkedDeleted(current_node_id);
+            std::vector<tableint> neighbors = getConnectionsWithSharedLock(current_node_id, 0);
             if (collect_metrics) {
                 metric_hops++;
-                metric_distance_computations+=size;
+                metric_distance_computations += neighbors.size();
             }
 
-#ifdef USE_SSE
-            _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
-            _mm_prefetch((char *) (visited_array + *(data + 1) + 64), _MM_HINT_T0);
-            _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
-            _mm_prefetch((char *) (data + 2), _MM_HINT_T0);
-#endif
-
-            for (size_t j = 1; j <= size; j++) {
-                int candidate_id = *(data + j);
-//                    if (candidate_id == 0) continue;
-#ifdef USE_SSE
-                _mm_prefetch((char *) (visited_array + *(data + j + 1)), _MM_HINT_T0);
-                _mm_prefetch(data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_ + offsetData_,
-                                _MM_HINT_T0);  ////////////
-#endif
+            for (size_t j = 0; j < neighbors.size(); j++) {
+                tableint candidate_id = neighbors[j];
                 if (!(visited_array[candidate_id] == visited_array_tag)) {
                     visited_array[candidate_id] = visited_array_tag;
 
@@ -501,8 +647,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                                         _MM_HINT_T0);  ////////////////////////
 #endif
 
-                        if (bare_bone_search || 
-                            (!isMarkedDeleted(candidate_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(candidate_id))))) {
+                        if (bare_bone_search ||
+                            (!isMarkedDeletedWithSharedLock(candidate_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(candidate_id))))) {
                             top_candidates.emplace(dist, candidate_id);
                             if (!bare_bone_search && stop_condition) {
                                 stop_condition->add_point_to_result(getExternalLabel(candidate_id), currObj1, dist);
@@ -556,8 +702,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
 
         dist_t lowerBound;
-        if (bare_bone_search || 
-            (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
+        if (bare_bone_search ||
+            (!isMarkedDeletedWithSharedLock(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
             char* ep_data = getDataByInternalId(ep_id);
             dist_t dist = fstdistfunc_(data_point, ep_data, dist_func_param_);
             lowerBound = dist;
@@ -594,29 +740,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             candidate_set.pop();
 
             tableint current_node_id = current_node_pair.second;
-            int *data = (int *) get_linklist0(current_node_id);
-            size_t size = getListCount((linklistsizeint*)data);
-//                bool cur_node_deleted = isMarkedDeleted(current_node_id);
+            std::vector<tableint> neighbors = getConnectionsWithSharedLock(current_node_id, 0);
             if (collect_metrics) {
                 metric_hops++;
-                metric_distance_computations+=size;
+                metric_distance_computations += neighbors.size();
             }
 
-#ifdef USE_SSE
-            _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
-            _mm_prefetch((char *) (visited_array + *(data + 1) + 64), _MM_HINT_T0);
-            _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
-            _mm_prefetch((char *) (data + 2), _MM_HINT_T0);
-#endif
-
-            for (size_t j = 1; j <= size; j++) {
-                int candidate_id = *(data + j);
-//                    if (candidate_id == 0) continue;
-#ifdef USE_SSE
-                _mm_prefetch((char *) (visited_array + *(data + j + 1)), _MM_HINT_T0);
-                _mm_prefetch(data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_ + offsetData_,
-                                _MM_HINT_T0);  ////////////
-#endif
+            for (size_t j = 0; j < neighbors.size(); j++) {
+                tableint candidate_id = neighbors[j];
                 if (!(visited_array[candidate_id] == visited_array_tag)) {
                     visited_array[candidate_id] = visited_array_tag;
                     visitedNodes.emplace_back(candidate_id);
@@ -639,8 +770,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                                         _MM_HINT_T0);  ////////////////////////
 #endif
 
-                        if (bare_bone_search || 
-                            (!isMarkedDeleted(candidate_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(candidate_id))))) {
+                        if (bare_bone_search ||
+                            (!isMarkedDeletedWithSharedLock(candidate_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(candidate_id))))) {
                             top_candidates.emplace(dist, candidate_id);
                             if (!bare_bone_search && stop_condition) {
                                 stop_condition->add_point_to_result(getExternalLabel(candidate_id), currObj1, dist);
@@ -775,33 +906,113 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             top_candidates.pop();
         }
 
-        tableint next_closest_entry_point = selectedNeighbors.back();
+        tableint next_closest_entry_point = selectedNeighbors.empty() ? cur_c : selectedNeighbors.back();
 
         if(!isDelete){
-            // lock only during the update
-            // because during the addition the lock for cur_c is already acquired
+            std::vector<tableint> write_set = selectedNeighbors;
+            write_set.emplace_back(cur_c);
+            std::sort(write_set.begin(), write_set.end());
+            write_set.erase(std::unique(write_set.begin(), write_set.end()), write_set.end());
+            std::vector<std::unique_lock<std::shared_mutex>> write_locks = lockNodesUnique(write_set);
+
+            std::vector<tableint> live_selected_neighbors;
+            live_selected_neighbors.reserve(selectedNeighbors.size());
+            for (tableint neighbor : selectedNeighbors) {
+                if (neighbor == cur_c || level > element_levels_[neighbor] || isMarkedDeleted(neighbor)) {
+                    continue;
+                }
+                live_selected_neighbors.emplace_back(neighbor);
+            }
+            next_closest_entry_point = live_selected_neighbors.empty() ? cur_c : live_selected_neighbors.back();
+
+            std::unordered_map<tableint, std::vector<tableint>> old_neighbors_by_node;
+            old_neighbors_by_node.reserve(write_set.size());
+            for (tableint node_id : write_set) {
+                if (level <= element_levels_[node_id]) {
+                    old_neighbors_by_node.emplace(node_id, getConnectionsNoLock(node_id, level));
+                }
+            }
+
             linklistsizeint *ll_cur;
             if (level == 0)
                 ll_cur = get_linklist0(cur_c);
             else
                 ll_cur = get_linklist(cur_c, level);
 
-            if (*ll_cur) {
+            if (getListCount(ll_cur) != 0) {
                 throw std::runtime_error("The newly inserted element should have blank link list");
             }
-            setListCount(ll_cur, selectedNeighbors.size());
+            setListCount(ll_cur, live_selected_neighbors.size());
             tableint *data = (tableint *) (ll_cur + 1);
-            for (size_t idx = 0; idx < selectedNeighbors.size(); idx++) {
+            for (size_t idx = 0; idx < live_selected_neighbors.size(); idx++) {
                 if (data[idx])
                     throw std::runtime_error("Possible memory corruption");
-                if (level > element_levels_[selectedNeighbors[idx]])
-                    throw std::runtime_error("Trying to make a link on a non-existent level");
-                data[idx] = selectedNeighbors[idx];
+                data[idx] = live_selected_neighbors[idx];
             }
+
+            for (size_t idx = 0; idx < live_selected_neighbors.size(); idx++) {
+                linklistsizeint *ll_other;
+                if (level == 0)
+                    ll_other = get_linklist0(live_selected_neighbors[idx]);
+                else
+                    ll_other = get_linklist(live_selected_neighbors[idx], level);
+
+                size_t sz_link_list_other = getListCount(ll_other);
+
+                if (sz_link_list_other > Mcurmax)
+                    throw std::runtime_error("Bad value of sz_link_list_other");
+                if (live_selected_neighbors[idx] == cur_c)
+                    throw std::runtime_error("Trying to connect an element to itself");
+
+                tableint *data = (tableint *) (ll_other + 1);
+
+                if (sz_link_list_other < Mcurmax) {
+                    data[sz_link_list_other] = cur_c;
+                    setListCount(ll_other, sz_link_list_other + 1);
+                } else {
+                    dist_t d_max = fstdistfunc_(getDataByInternalId(cur_c), getDataByInternalId(live_selected_neighbors[idx]),
+                                                dist_func_param_);
+                    std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidates;
+                    candidates.emplace(d_max, cur_c);
+
+                    for (size_t j = 0; j < sz_link_list_other; j++) {
+                        if (data[j] == cur_c || isMarkedDeleted(data[j])) {
+                            continue;
+                        }
+                        candidates.emplace(
+                                fstdistfunc_(getDataByInternalId(data[j]), getDataByInternalId(live_selected_neighbors[idx]),
+                                                dist_func_param_), data[j]);
+                    }
+
+                    getNeighborsByHeuristic2(candidates, Mcurmax);
+
+                    int indx = 0;
+                    while (candidates.size() > 0) {
+                        data[indx] = candidates.top().second;
+                        candidates.pop();
+                        indx++;
+                    }
+
+                    setListCount(ll_other, indx);
+                }
+            }
+
+            std::unique_lock<std::shared_mutex> reverse_lock(reverse_links_lock_);
+            for (tableint node_id : write_set) {
+                if (level > element_levels_[node_id]) {
+                    continue;
+                }
+                syncReverseLinksForSourceNoLock(
+                    node_id,
+                    level,
+                    old_neighbors_by_node[node_id],
+                    getConnectionsNoLock(node_id, level));
+            }
+            return next_closest_entry_point;
         }
 
         for (size_t idx = 0; idx < selectedNeighbors.size(); idx++) {
-            std::unique_lock <std::mutex> lock(link_list_locks_[selectedNeighbors[idx]]);
+            std::unique_lock<std::shared_mutex> lock(link_list_locks_[selectedNeighbors[idx]]);
 
             linklistsizeint *ll_other;
             if (level == 0)
@@ -819,6 +1030,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 throw std::runtime_error("Trying to make a link on a non-existent level");
 
             tableint *data = (tableint *) (ll_other + 1);
+            std::vector<tableint> old_neighbors(data, data + sz_link_list_other);
 
             bool is_cur_c_present = false;
             if (isDelete) {
@@ -873,6 +1085,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     } */
                 }
             }
+
+            std::vector<tableint> new_neighbors = getConnectionsNoLock(selectedNeighbors[idx], level);
+            std::unique_lock<std::shared_mutex> reverse_lock(reverse_links_lock_);
+            syncReverseLinksForSourceNoLock(selectedNeighbors[idx], level, old_neighbors, new_neighbors);
         }
         return next_closest_entry_point;
     }
@@ -884,8 +1100,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         visited_list_pool_.reset(new VisitedListPool(1, new_max_elements));
 
         element_levels_.resize(new_max_elements);
+        reverse_link_lists_.resize(new_max_elements, std::vector<std::vector<tableint>>(1));
 
-        std::vector<std::mutex>(new_max_elements).swap(link_list_locks_);
+        std::vector<std::shared_mutex>(new_max_elements).swap(link_list_locks_);
 
         // Reallocate base layer
         char * data_level0_memory_new = (char *) realloc(data_level0_memory_, new_max_elements * size_data_per_element_);
@@ -1029,7 +1246,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
 
         size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
-        std::vector<std::mutex>(max_elements).swap(link_list_locks_);
+        std::vector<std::shared_mutex>(max_elements).swap(link_list_locks_);
         std::vector<std::mutex>(MAX_LABEL_OPERATION_LOCKS).swap(label_op_locks_);
 
         visited_list_pool_.reset(new VisitedListPool(1, max_elements));
@@ -1063,6 +1280,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
         }
 
+        reverse_link_lists_.assign(max_elements_, std::vector<std::vector<tableint>>(1));
+        for (size_t i = 0; i < cur_element_count; i++) {
+            reverse_link_lists_[i].resize(element_levels_[i] + 1);
+        }
+        rebuildReverseAdjacency();
+
         input.close();
 
         deleteFlags=new bool[max_elements_];
@@ -1077,9 +1300,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         // lock all operations with element by label
         std::unique_lock <std::mutex> lock_label(getLabelOpMutex(label));
         
-        std::unique_lock <std::mutex> lock_table(label_lookup_lock);
+        std::shared_lock<std::shared_mutex> lock_table(label_lookup_lock);
         auto search = label_lookup_.find(label);
-        if (search == label_lookup_.end() || isMarkedDeleted(search->second)) {
+        if (search == label_lookup_.end() || isMarkedDeletedWithSharedLock(search->second)) {
             throw std::runtime_error("Label not found");
         }
         tableint internalId = search->second;
@@ -1103,7 +1326,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         // lock all operations with element by label
         std::unique_lock <std::mutex> lock_label(getLabelOpMutex(label));
 
-        std::unique_lock <std::mutex> lock_table(label_lookup_lock);
+        std::unique_lock<std::shared_mutex> lock_table(label_lookup_lock);
         auto search = label_lookup_.find(label);
         if (search == label_lookup_.end()) {
             throw std::runtime_error("Label not found");
@@ -1122,6 +1345,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     */
     void markDeletedInternal(tableint internalId) {
         assert(internalId < cur_element_count);
+        std::unique_lock<std::shared_mutex> node_lock(link_list_locks_[internalId]);
         if (!isMarkedDeleted(internalId)) {
             unsigned char *ll_cur = ((unsigned char *)get_linklist0(internalId))+2;
             *ll_cur |= DELETE_MARK;
@@ -1146,7 +1370,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         // lock all operations with element by label
         std::unique_lock <std::mutex> lock_label(getLabelOpMutex(label));
 
-        std::unique_lock <std::mutex> lock_table(label_lookup_lock);
+        std::unique_lock<std::shared_mutex> lock_table(label_lookup_lock);
         auto search = label_lookup_.find(label);
         if (search == label_lookup_.end()) {
             throw std::runtime_error("Label not found");
@@ -1164,6 +1388,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     */
     void unmarkDeletedInternal(tableint internalId) {
         assert(internalId < cur_element_count);
+        std::unique_lock<std::shared_mutex> node_lock(link_list_locks_[internalId]);
         if (isMarkedDeleted(internalId)) {
             unsigned char *ll_cur = ((unsigned char *)get_linklist0(internalId)) + 2;
             *ll_cur &= ~DELETE_MARK;
@@ -1210,23 +1435,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         addPoint(data_point, label, -1);
     }
 
+    // Legacy name kept for existing batch repair code paths.
+    // This now returns a read snapshot under a shared node lock.
     std::vector<tableint> getConnectionsWithLock(tableint internalId, int level) {
-        std::unique_lock <std::mutex> lock(link_list_locks_[internalId]);
-        unsigned int *data = get_linklist_at_level(internalId, level);
-        int size = getListCount(data);
-        std::vector<tableint> result(size);
-        tableint *ll = (tableint *) (data + 1);
-        memcpy(result.data(), ll, size * sizeof(tableint));
-        return result;
+        return getConnectionsWithSharedLock(internalId, level);
     }
 
     std::vector<tableint> getConnectionsNOTWithLock(tableint internalId, int level) {
-        unsigned int *data = get_linklist_at_level(internalId, level);
-        int size = getListCount(data);
-        std::vector<tableint> result(size);
-        tableint *ll = (tableint *) (data + 1);
-        memcpy(result.data(), ll, size * sizeof(tableint));
-        return result;
+        return getConnectionsNoLock(internalId, level);
     }
 
 
@@ -1235,7 +1451,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         {
             // Checking if the element with the same label already exists
             // if so, updating it *instead* of creating a new element.
-            std::unique_lock <std::mutex> lock_table(label_lookup_lock);
+            std::unique_lock<std::shared_mutex> lock_table(label_lookup_lock);
             auto search = label_lookup_.find(label);
             if (search != label_lookup_.end()) {
                 throw std::runtime_error("The label is exised.");
@@ -1261,32 +1477,37 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             label_lookup_[label] = cur_c;
         }
 
-        std::unique_lock <std::mutex> lock_el(link_list_locks_[cur_c]);
         int curlevel = getRandomLevel(mult_);
         if (level > 0)
             curlevel = level;
 
-        element_levels_[cur_c] = curlevel;
+        std::unique_lock<std::shared_mutex> templock(metadata_lock_);
+        {
+            std::unique_lock<std::shared_mutex> lock_el(link_list_locks_[cur_c]);
+            element_levels_[cur_c] = curlevel;
 
-        std::unique_lock <std::mutex> templock(global);
+            memset(data_level0_memory_ + cur_c * size_data_per_element_ + offsetLevel0_, 0, size_data_per_element_);
+            unsigned char *ll_cur = ((unsigned char *)get_linklist0(cur_c)) + 2;
+            *ll_cur |= DELETE_MARK;
+            num_deleted_ += 1;
+
+            // Initialisation of the data and label
+            memcpy(getExternalLabeLp(cur_c), &label, sizeof(labeltype));
+            memcpy(getDataByInternalId(cur_c), data_point, data_size_);
+
+            if (curlevel) {
+                linkLists_[cur_c] = (char *) malloc(size_links_per_element_ * curlevel + 1);
+                if (linkLists_[cur_c] == nullptr)
+                    throw std::runtime_error("Not enough memory: addPoint failed to allocate linklist");
+                memset(linkLists_[cur_c], 0, size_links_per_element_ * curlevel + 1);
+            }
+        }
+
         int maxlevelcopy = maxlevel_;
         if (curlevel <= maxlevelcopy)
             templock.unlock();
         tableint currObj = enterpoint_node_;
         tableint enterpoint_copy = enterpoint_node_;
-
-        memset(data_level0_memory_ + cur_c * size_data_per_element_ + offsetLevel0_, 0, size_data_per_element_);
-
-        // Initialisation of the data and label
-        memcpy(getExternalLabeLp(cur_c), &label, sizeof(labeltype));
-        memcpy(getDataByInternalId(cur_c), data_point, data_size_);
-
-        if (curlevel) {
-            linkLists_[cur_c] = (char *) malloc(size_links_per_element_ * curlevel + 1);
-            if (linkLists_[cur_c] == nullptr)
-                throw std::runtime_error("Not enough memory: addPoint failed to allocate linklist");
-            memset(linkLists_[cur_c], 0, size_links_per_element_ * curlevel + 1);
-        }
         
         if ((signed)currObj != -1) {
             if (curlevel < maxlevelcopy) {
@@ -1296,7 +1517,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     while (changed) {
                         changed = false;
                         unsigned int *data;
-                        std::unique_lock <std::mutex> lock(link_list_locks_[currObj]);
+                        std::unique_lock<std::shared_mutex> lock(link_list_locks_[currObj]);
                         data = get_linklist(currObj, level);
                         int size = getListCount(data);
 
@@ -1335,6 +1556,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         if (curlevel > maxlevelcopy) {
             enterpoint_node_ = cur_c;
             maxlevel_ = curlevel;
+        }
+        {
+            std::unique_lock<std::shared_mutex> lock_el(link_list_locks_[cur_c]);
+            unsigned char *ll_cur = ((unsigned char *)get_linklist0(cur_c)) + 2;
+            *ll_cur &= ~DELETE_MARK;
+            num_deleted_ -= 1;
         }
         return cur_c;
     }
@@ -1403,10 +1630,287 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     #define APPROXIMATE_TWOHOP_DELETE 4
     #define REFACTOR_DELETE 5
 
+    bool supportsConcurrentTwoHopDelete(int deleteModel) const {
+        return deleteModel == TWOHOP_DELETE || deleteModel == APPROXIMATE_TWOHOP_DELETE;
+    }
+
+    std::vector<std::unique_lock<std::shared_mutex>> lockNodesUnique(
+        const std::vector<tableint> &node_ids) {
+        std::vector<std::unique_lock<std::shared_mutex>> locks;
+        locks.reserve(node_ids.size());
+        for (tableint node_id : node_ids) {
+            locks.emplace_back(link_list_locks_[node_id]);
+        }
+        return locks;
+    }
+
+    std::vector<tableint> collectConcurrentDeleteNeighborhood(
+        tableint internalId,
+        int deleteModel,
+        std::vector<std::vector<tableint>> &affected_by_level) const {
+        std::unordered_set<tableint> neighborhood;
+        neighborhood.emplace(internalId);
+
+        affected_by_level.assign(element_levels_[internalId] + 1, {});
+        for (int level = element_levels_[internalId]; level >= 0; level--) {
+            affected_by_level[level] = getReverseConnectionsWithSharedLock(internalId, level);
+            std::vector<tableint> deleted_neighbors = getConnectionsWithSharedLock(internalId, level);
+
+            neighborhood.insert(affected_by_level[level].begin(), affected_by_level[level].end());
+            neighborhood.insert(deleted_neighbors.begin(), deleted_neighbors.end());
+
+            for (tableint affected : affected_by_level[level]) {
+                if (affected >= cur_element_count || level > element_levels_[affected]) {
+                    continue;
+                }
+                std::vector<tableint> one_hop = getConnectionsWithSharedLock(affected, level);
+                neighborhood.insert(one_hop.begin(), one_hop.end());
+                for (tableint one_hop_node : one_hop) {
+                    if (one_hop_node >= cur_element_count || level > element_levels_[one_hop_node]) {
+                        continue;
+                    }
+                    std::vector<tableint> two_hop = getConnectionsWithSharedLock(one_hop_node, level);
+                    neighborhood.insert(two_hop.begin(), two_hop.end());
+                }
+            }
+
+            if (deleteModel == APPROXIMATE_TWOHOP_DELETE) {
+                for (tableint one_hop_node : deleted_neighbors) {
+                    if (one_hop_node >= cur_element_count || level > element_levels_[one_hop_node]) {
+                        continue;
+                    }
+                    std::vector<tableint> two_hop = getConnectionsWithSharedLock(one_hop_node, level);
+                    neighborhood.insert(two_hop.begin(), two_hop.end());
+                }
+            }
+        }
+
+        std::vector<tableint> neighborhood_ids(neighborhood.begin(), neighborhood.end());
+        std::sort(neighborhood_ids.begin(), neighborhood_ids.end());
+        return neighborhood_ids;
+    }
+
+    std::vector<tableint> buildTwoHopRepairNeighborsLocked(
+        tableint source,
+        tableint deletedId,
+        int level,
+        int newLinkSize,
+        const std::unordered_set<tableint> &locked_nodes) {
+        size_t Mcurmax = level ? maxM_ : maxM0_;
+        size_t candidate_limit = std::max(static_cast<size_t>(newLinkSize) * 5, Mcurmax);
+        std::unordered_set<tableint> candidate_ids;
+        std::vector<tableint> current_neighbors = getConnectionsNoLock(source, level);
+        std::vector<tableint> live_neighbors;
+
+        for (tableint neighbor : current_neighbors) {
+            if (neighbor == deletedId || neighbor == source || isMarkedDeleted(neighbor)) {
+                continue;
+            }
+            candidate_ids.emplace(neighbor);
+            live_neighbors.emplace_back(neighbor);
+        }
+
+        for (tableint one_hop : live_neighbors) {
+            if (!locked_nodes.count(one_hop) || level > element_levels_[one_hop]) {
+                continue;
+            }
+            std::vector<tableint> two_hop_neighbors = getConnectionsNoLock(one_hop, level);
+            for (tableint two_hop : two_hop_neighbors) {
+                if (two_hop == deletedId || two_hop == source || isMarkedDeleted(two_hop)) {
+                    continue;
+                }
+                candidate_ids.emplace(two_hop);
+                if (candidate_ids.size() >= candidate_limit) {
+                    break;
+                }
+            }
+            if (candidate_ids.size() >= candidate_limit) {
+                break;
+            }
+        }
+
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidates;
+        for (tableint candidate : candidate_ids) {
+            candidates.emplace(
+                fstdistfunc_(getDataByInternalId(source), getDataByInternalId(candidate), dist_func_param_),
+                candidate);
+        }
+
+        getNeighborsByHeuristic2(candidates, Mcurmax);
+        std::vector<tableint> new_neighbors;
+        while (!candidates.empty()) {
+            new_neighbors.emplace_back(candidates.top().second);
+            candidates.pop();
+        }
+        return new_neighbors;
+    }
+
+    std::vector<tableint> buildApproximateTwoHopRepairNeighborsLocked(
+        tableint source,
+        tableint deletedId,
+        int level,
+        int newLinkSize,
+        const std::unordered_set<tableint> &locked_nodes) {
+        size_t Mcurmax = level ? maxM_ : maxM0_;
+        size_t candidate_limit = std::max(static_cast<size_t>(newLinkSize) * 2, Mcurmax);
+        std::unordered_set<tableint> candidate_ids;
+        std::vector<tableint> current_neighbors = getConnectionsNoLock(source, level);
+        dist_t source_to_deleted = fstdistfunc_(getDataByInternalId(source), getDataByInternalId(deletedId), dist_func_param_);
+
+        for (tableint neighbor : current_neighbors) {
+            if (neighbor != deletedId && neighbor != source && !isMarkedDeleted(neighbor)) {
+                candidate_ids.emplace(neighbor);
+            }
+        }
+
+        std::vector<tableint> deleted_neighbors = getConnectionsNoLock(deletedId, level);
+        for (tableint one_hop : deleted_neighbors) {
+            if (one_hop == source || one_hop == deletedId || isMarkedDeleted(one_hop)) {
+                continue;
+            }
+
+            dist_t source_to_one_hop =
+                fstdistfunc_(getDataByInternalId(source), getDataByInternalId(one_hop), dist_func_param_);
+            if (source_to_one_hop >= source_to_deleted) {
+                continue;
+            }
+
+            candidate_ids.emplace(one_hop);
+            if (!locked_nodes.count(one_hop) || level > element_levels_[one_hop]) {
+                continue;
+            }
+
+            std::vector<tableint> two_hop_neighbors = getConnectionsNoLock(one_hop, level);
+            for (tableint two_hop : two_hop_neighbors) {
+                if (two_hop == source || two_hop == deletedId || isMarkedDeleted(two_hop)) {
+                    continue;
+                }
+
+                dist_t deleted_to_two_hop =
+                    fstdistfunc_(getDataByInternalId(deletedId), getDataByInternalId(two_hop), dist_func_param_);
+                dist_t source_to_two_hop =
+                    fstdistfunc_(getDataByInternalId(source), getDataByInternalId(two_hop), dist_func_param_);
+
+                if (deleted_to_two_hop > source_to_deleted &&
+                    source_to_two_hop < source_to_deleted &&
+                    source_to_two_hop + source_to_deleted > deleted_to_two_hop) {
+                    candidate_ids.emplace(two_hop);
+                    if (candidate_ids.size() >= candidate_limit) {
+                        break;
+                    }
+                }
+            }
+            if (candidate_ids.size() >= candidate_limit) {
+                break;
+            }
+        }
+
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidates;
+        for (tableint candidate : candidate_ids) {
+            candidates.emplace(
+                fstdistfunc_(getDataByInternalId(source), getDataByInternalId(candidate), dist_func_param_),
+                candidate);
+        }
+
+        getNeighborsByHeuristic2(candidates, Mcurmax);
+        std::vector<tableint> new_neighbors;
+        while (!candidates.empty()) {
+            new_neighbors.emplace_back(candidates.top().second);
+            candidates.pop();
+        }
+        return new_neighbors;
+    }
+
+    void updateEntrypointForConcurrentDeleteLocked(
+        tableint deletedId,
+        const std::vector<tableint> &locked_nodes) {
+        if (enterpoint_node_ != deletedId) {
+            return;
+        }
+
+        tableint replacement = deletedId;
+        int replacement_level = maxlevel_;
+        for (tableint candidate : locked_nodes) {
+            if (candidate == deletedId || isMarkedDeleted(candidate)) {
+                continue;
+            }
+            if (replacement == deletedId || element_levels_[candidate] > replacement_level) {
+                replacement = candidate;
+                replacement_level = element_levels_[candidate];
+            }
+        }
+
+        if (replacement != deletedId) {
+            enterpoint_node_ = replacement;
+            maxlevel_ = replacement_level;
+        }
+    }
+
+    void deletePointConcurrent(labeltype label, int deleteModel, int newLinkSize) {
+        if (!supportsConcurrentTwoHopDelete(deleteModel)) {
+            throw std::runtime_error("Concurrent delete only supports TWOHOP_DELETE and APPROXIMATE_TWOHOP_DELETE");
+        }
+
+        std::unique_lock<std::mutex> lock_label(getLabelOpMutex(label));
+        tableint internalId = 0;
+        bool update_entrypoint = false;
+        {
+            std::unique_lock<std::shared_mutex> lock_table(label_lookup_lock);
+            auto search = label_lookup_.find(label);
+            if (search == label_lookup_.end()) {
+                throw std::runtime_error("Label not found");
+            }
+            internalId = search->second;
+            update_entrypoint = (getSearchMetadataSnapshot().enterpoint_node == internalId);
+        }
+
+        markDeletedInternal(internalId);
+        {
+            std::unique_lock<std::shared_mutex> lock_table(label_lookup_lock);
+            label_lookup_.erase(label);
+        }
+
+        std::vector<std::vector<tableint>> affected_by_level;
+        std::vector<tableint> neighborhood = collectConcurrentDeleteNeighborhood(internalId, deleteModel, affected_by_level);
+        std::unordered_set<tableint> locked_node_set(neighborhood.begin(), neighborhood.end());
+
+        std::unique_lock<std::shared_mutex> metadata_lock(metadata_lock_, std::defer_lock);
+        if (update_entrypoint) {
+            metadata_lock.lock();
+        }
+        std::vector<std::unique_lock<std::shared_mutex>> node_locks = lockNodesUnique(neighborhood);
+
+        if (update_entrypoint) {
+            updateEntrypointForConcurrentDeleteLocked(internalId, neighborhood);
+        }
+
+        for (int level = element_levels_[internalId]; level >= 0; level--) {
+            for (tableint affected : affected_by_level[level]) {
+                if (affected == internalId || affected >= cur_element_count) {
+                    continue;
+                }
+                if (level > element_levels_[affected] || isMarkedDeleted(affected)) {
+                    continue;
+                }
+
+                std::vector<tableint> repaired_neighbors;
+                if (deleteModel == TWOHOP_DELETE) {
+                    repaired_neighbors = buildTwoHopRepairNeighborsLocked(
+                        affected, internalId, level, newLinkSize, locked_node_set);
+                } else {
+                    repaired_neighbors = buildApproximateTwoHopRepairNeighborsLocked(
+                        affected, internalId, level, newLinkSize, locked_node_set);
+                }
+                replaceConnectionsLocked(affected, level, repaired_neighbors);
+            }
+        }
+    }
+
     void mulLink(tableint thePoint, int level,vector<pair<dist_t, tableint>> &cand){
         // cout<<cand.size()<<endl;
         size_t Mcurmax = level ? maxM_ : maxM0_;
-        std::unique_lock <std::mutex> lock(link_list_locks_[thePoint]);
+        std::unique_lock<std::shared_mutex> lock(link_list_locks_[thePoint]);
+        std::vector<tableint> old_neighbors = getConnectionsNoLock(thePoint, level);
         unsigned int *thePoint_data = get_linklist_at_level(thePoint, level);
         int thePoint_size = getListCount(thePoint_data);
         tableint *thePoint_datal = (tableint *) (thePoint_data + 1);
@@ -1435,6 +1939,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
             setListCount(thePoint_data, thePoint_size);
         }
+        std::vector<tableint> new_neighbors = getConnectionsNoLock(thePoint, level);
+        std::unique_lock<std::shared_mutex> reverse_lock(reverse_links_lock_);
+        syncReverseLinksForSourceNoLock(thePoint, level, old_neighbors, new_neighbors);
     }
 
     void patchDelete(vector<labeltype>deleteList,int deleteModel,int newLinkSize,int num_threads){
@@ -1442,7 +1949,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         bool changeEp=false;       
         ParallelFor(0, deleteList.size(), num_threads, [&](size_t row, size_t threadId) {
             labeltype label=deleteList[row];
-            std::unique_lock <std::mutex> lock_table(label_lookup_lock); //get internalId
+            std::unique_lock<std::shared_mutex> lock_table(label_lookup_lock); //get internalId
             auto search = label_lookup_.find(label);
             if (search == label_lookup_.end()) {
                 std::cout<<"delete element don`t exit!!! "<<label<<std::endl;
@@ -1469,7 +1976,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         ParallelFor(deleteStart, deleteStart+deleteLen, num_threads, [&](size_t row, size_t threadId) {
             labeltype label=row;
-            std::unique_lock <std::mutex> lock_table(label_lookup_lock); //get internalId
+            std::unique_lock<std::shared_mutex> lock_table(label_lookup_lock); //get internalId
             auto search = label_lookup_.find(label);
             if (search == label_lookup_.end()) {
                 std::cout<<"delete element don`t exit!!! "<<label<<std::endl;
@@ -1503,11 +2010,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     inline void patchDeleteInternalDeleteList(vector<tableint> internalDeleteList,int deleteModel,int num_threads,int newLinkSize,bool changeEp){   
         if(changeEp){                   //update enterpoint_node
             std::cout<<"delete enterpoint_node_"<<std::endl;
-            std::unique_lock <std::mutex> templock(global);
+            std::unique_lock<std::shared_mutex> templock(metadata_lock_);
             tableint internalId=enterpoint_node_;
             bool changeOver=false;
             for(int level=element_levels_[enterpoint_node_];level>=0&&!changeOver;level--){
-                std::unique_lock <std::mutex> lock(link_list_locks_[internalId]);
+                std::unique_lock<std::shared_mutex> lock(link_list_locks_[internalId]);
                 unsigned int *data = get_linklist_at_level(internalId, level);
                 int size = getListCount(data);
                 tableint *datal = (tableint *) (data + 1);
@@ -1531,7 +2038,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         // }
         ParallelFor(0, cur_element_count, num_threads, [&](size_t row, size_t threadId) {
             for(int level=element_levels_[row];level>=0;level--){   //update inpoint  
-                std::unique_lock <std::mutex> lock(link_list_locks_[row]);
+                std::unique_lock<std::shared_mutex> lock(link_list_locks_[row]);
                 unsigned int *data = get_linklist_at_level(row, level);
                 int size = getListCount(data);
                 tableint *datal = (tableint *) (data + 1);
@@ -1675,6 +2182,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             std::unique_lock <std::mutex> deleteList_lock(deleted_internalId_lock);
             deleted_internalId.emplace(internalId);
         });
+        rebuildReverseAdjacency();
     }
 
     std::priority_queue<std::pair<dist_t, labeltype >>
@@ -1682,35 +2190,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::priority_queue<std::pair<dist_t, labeltype >> result;
         if (cur_element_count == 0) return result;
 
-        tableint currObj = enterpoint_node_;
-        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
-
-        for (int level = maxlevel_; level > 0; level--) {
-            bool changed = true;
-            while (changed) {
-                changed = false;
-                unsigned int *data;
-
-                data = (unsigned int *) get_linklist(currObj, level);
-                int size = getListCount(data);
-                metric_hops++;
-                metric_distance_computations+=size;
-
-                tableint *datal = (tableint *) (data + 1);
-                for (int i = 0; i < size; i++) {
-                    tableint cand = datal[i];
-                    if (cand < 0 || cand > max_elements_)
-                        throw std::runtime_error("cand error");
-                    dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
-
-                    if (d < curdist) {
-                        curdist = d;
-                        currObj = cand;
-                        changed = true;
-                    }
-                }
-            }
-        }
+        SearchMetadataSnapshot metadata = getSearchMetadataSnapshot();
+        tableint currObj = greedySearchUpperLayers(query_data, metadata);
 
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         bool bare_bone_search = !num_deleted_ && !isIdAllowed;
@@ -1738,35 +2219,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::priority_queue<std::pair<dist_t, labeltype >> result;
         if (cur_element_count == 0) return result;
 
-        tableint currObj = enterpoint_node_;
-        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
-
-        for (int level = maxlevel_; level > 0; level--) {
-            bool changed = true;
-            while (changed) {
-                changed = false;
-                unsigned int *data;
-
-                data = (unsigned int *) get_linklist(currObj, level);
-                int size = getListCount(data);
-                metric_hops++;
-                metric_distance_computations+=size;
-
-                tableint *datal = (tableint *) (data + 1);
-                for (int i = 0; i < size; i++) {
-                    tableint cand = datal[i];
-                    if (cand < 0 || cand > max_elements_)
-                        throw std::runtime_error("cand error");
-                    dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
-
-                    if (d < curdist) {
-                        curdist = d;
-                        currObj = cand;
-                        changed = true;
-                    }
-                }
-            }
-        }
+        SearchMetadataSnapshot metadata = getSearchMetadataSnapshot();
+        tableint currObj = greedySearchUpperLayers(query_data, metadata);
 
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         bool bare_bone_search = !num_deleted_ && !isIdAllowed;
@@ -1798,35 +2252,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::vector<std::pair<dist_t, labeltype >> result;
         if (cur_element_count == 0) return result;
 
-        tableint currObj = enterpoint_node_;
-        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
-
-        for (int level = maxlevel_; level > 0; level--) {
-            bool changed = true;
-            while (changed) {
-                changed = false;
-                unsigned int *data;
-
-                data = (unsigned int *) get_linklist(currObj, level);
-                int size = getListCount(data);
-                metric_hops++;
-                metric_distance_computations+=size;
-
-                tableint *datal = (tableint *) (data + 1);
-                for (int i = 0; i < size; i++) {
-                    tableint cand = datal[i];
-                    if (cand < 0 || cand > max_elements_)
-                        throw std::runtime_error("cand error");
-                    dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
-
-                    if (d < curdist) {
-                        curdist = d;
-                        currObj = cand;
-                        changed = true;
-                    }
-                }
-            }
-        }
+        SearchMetadataSnapshot metadata = getSearchMetadataSnapshot();
+        tableint currObj = greedySearchUpperLayers(query_data, metadata);
 
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         top_candidates = searchBaseLayerST<false>(currObj, query_data, 0, isIdAllowed, &stop_condition);
