@@ -26,7 +26,7 @@ struct Config {
     string data_file_path = "./datasets/sift_learn.fbin";
     string query_file_path = "./datasets/sift_query.fbin";
     string result_file_path = "./interleaved_results.csv";
-    size_t initial_active_count = 200000;
+    size_t initial_active_count = 20000;
     size_t total_ops = 20000;
     size_t validation_interval = 5000;
     size_t validation_queries = 32;
