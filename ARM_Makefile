@@ -1,7 +1,26 @@
-CXX=g++
+UNAME_M := $(shell uname -m)
+HOMEBREW_GCC := /opt/homebrew/bin/g++-14
+
+ifeq ($(origin CXX), default)
+ifneq ($(wildcard $(HOMEBREW_GCC)),)
+CXX := $(HOMEBREW_GCC)
+else
+CXX := g++
+endif
+endif
+
 GRAPH=HNSW
 DELETE_MODEL=DM_ATWOHOP
-CXXFLAGS= -I. -std=c++17 -Ofast -pthread -fopenmp -D__AVX__ -mavx2 -D$(GRAPH)
+BASE_CXXFLAGS := -I. -std=c++17 -Ofast -pthread -D$(GRAPH)
+OPENMP_FLAGS := -fopenmp
+
+ifeq ($(UNAME_M),x86_64)
+ARCH_FLAGS := -D__AVX__ -mavx2
+else
+ARCH_FLAGS :=
+endif
+
+CXXFLAGS := $(BASE_CXXFLAGS) $(OPENMP_FLAGS) $(ARCH_FLAGS)
 TARGET=hnsw_Wolverine_test
 INTERLEAVED_TARGET=hnsw_Wolverine_interleaved_test
 SRC=hnsw_Wolverine_test.cpp
