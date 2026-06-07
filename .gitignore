@@ -9,6 +9,9 @@ hnsw_Wolverine_interleaved_baseline
 
 # benchmark outputs
 sweep_runs/
+bench_runs/
 sweep_results*.csv
+mix_results*.csv
+*.png
 cwolverine-cmp-*.out
 cwolverine-cmp-*.err

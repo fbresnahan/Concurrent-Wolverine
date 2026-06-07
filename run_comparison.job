@@ -17,7 +17,7 @@
 #SBATCH --error=cwolverine-cmp-%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=01:00:00
+#SBATCH --time=02:00:00
 #SBATCH --mem=32G
 #
 # -------- CLUSTER SETTINGS (CNSI) -------------------------------------------
@@ -90,26 +90,44 @@ done
 case " $LIST " in *" $NCORES "*) : ;; *) LIST="$LIST $NCORES" ;; esac
 export THREADS="$LIST"
 
-# --- workload knobs (override here if desired) ------------------------------
+# --- shared knobs (override via --export=ALL,VAR=... if desired) ------------
+export REPEATS="${REPEATS:-3}"          # runs per data point -> error bars
+export DELETE_MODEL="${DELETE_MODEL:-3}" # 3=two-hop, 4=approx two-hop
+JID="${SLURM_JOB_ID:-local}"
+
+# === Experiment 1: thread scaling (fixed 80/10/10 mix) =====================
+export SEARCH_W=80 INSERT_W=10 DELETE_W=10
 export INITIAL_ACTIVE="${INITIAL_ACTIVE:-60000}"
 export TOTAL_OPS="${TOTAL_OPS:-400000}"
-export SEARCH_W="${SEARCH_W:-80}"
-export INSERT_W="${INSERT_W:-10}"
-export DELETE_W="${DELETE_W:-10}"
-export DELETE_MODEL="${DELETE_MODEL:-3}"
-export OUT="sweep_results_${SLURM_JOB_ID:-local}.csv"
-
-echo "Thread sweep:    $THREADS"
-echo "Workload:        initial_active=$INITIAL_ACTIVE total_ops=$TOTAL_OPS mix=$SEARCH_W/$INSERT_W/$DELETE_W model=$DELETE_MODEL"
-echo
-
+export OUT="sweep_results_${JID}.csv"
+echo "### Experiment 1: thread scaling  threads=[$THREADS] repeats=$REPEATS ###"
 bash ./sweep.sh
+
+# === Experiment 2: workload-mix sweep (fixed thread count = all cores) ======
+# Smaller index + fewer ops so write-heavy mixes stay under dataset capacity.
+export MIX_THREADS="$NCORES"
+export INITIAL_ACTIVE=20000
+export TOTAL_OPS=100000
+export OUT="mix_results_${JID}.csv"
+unset SEARCH_W INSERT_W DELETE_W   # mix_sweep.sh provides the mixes
+echo "### Experiment 2: workload-mix sweep @ ${MIX_THREADS} threads repeats=$REPEATS ###"
+bash ./mix_sweep.sh
+
+# === plots (optional; needs matplotlib) =====================================
+if command -v python3 >/dev/null 2>&1 && python3 -c "import matplotlib" 2>/dev/null; then
+  python3 plot_sweep.py "sweep_results_${JID}.csv" -o "sweep_results_${JID}.png" || true
+  python3 plot_mix.py   "mix_results_${JID}.csv"   -o "mix_results_${JID}.png"   || true
+else
+  echo "(matplotlib not available — copy the CSVs locally and run plot_sweep.py / plot_mix.py)"
+fi
 
 echo
 echo "================ results ===================="
-cat "$OUT"
+echo "--- thread scaling (sweep_results_${JID}.csv) ---"; cat "sweep_results_${JID}.csv"
+echo "--- workload mix  (mix_results_${JID}.csv) ---";    cat "mix_results_${JID}.csv"
 echo "============================================="
-echo "CSV written to: $OUT"
+echo "CSVs:  sweep_results_${JID}.csv  mix_results_${JID}.csv"
+echo "PNGs:  sweep_results_${JID}.png  mix_results_${JID}.png  (if matplotlib present)"
 
 # =============================================================================
 # Finding your cluster's settings (run these on the login node before sbatch):
