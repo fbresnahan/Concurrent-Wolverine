@@ -503,8 +503,10 @@ int main(int argc, char **argv) {
     }
 
     Config config = parsed.config;
-    if (config.delete_model != TWOHOP_DELETE && config.delete_model != APPROXIMATE_TWOHOP_DELETE) {
-        throw runtime_error("interleaved benchmark only supports TWOHOP_DELETE and APPROXIMATE_TWOHOP_DELETE");
+    if (config.delete_model != SEARCH_DELETE &&
+        config.delete_model != TWOHOP_DELETE &&
+        config.delete_model != APPROXIMATE_TWOHOP_DELETE) {
+        throw runtime_error("interleaved benchmark supports SEARCH_DELETE(2), TWOHOP_DELETE(3), APPROXIMATE_TWOHOP_DELETE(4)");
     }
 
     int32_t dim = 0;

@@ -574,6 +574,60 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return top_candidates;
     }
 
+    // Read-only per-level greedy search using SHARED link-list locks. Mirrors
+    // MYsearchBaseLayer (which takes UNIQUE locks at each node and would serialize
+    // concurrent repair searches). Used by the online SEARCH_DELETE repair: it
+    // runs lock-free of writers (only momentary shared reads), so many concurrent
+    // deletes can search in parallel. Returns the (closest-first prunable) top_ef.
+    std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
+    searchLayerShared(tableint ep_id, const void *data_point, int layer, size_t ef) const {
+        VisitedList *vl = visited_list_pool_->getFreeVisitedList();
+        vl_type *visited_array = vl->mass;
+        vl_type visited_array_tag = vl->curV;
+
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidateSet;
+
+        dist_t lowerBound;
+        if (!isMarkedDeletedWithSharedLock(ep_id)) {
+            dist_t dist = fstdistfunc_(data_point, getDataByInternalId(ep_id), dist_func_param_);
+            top_candidates.emplace(dist, ep_id);
+            lowerBound = dist;
+            candidateSet.emplace(-dist, ep_id);
+        } else {
+            lowerBound = std::numeric_limits<dist_t>::max();
+            candidateSet.emplace(-lowerBound, ep_id);
+        }
+        visited_array[ep_id] = visited_array_tag;
+
+        while (!candidateSet.empty()) {
+            std::pair<dist_t, tableint> curr_el_pair = candidateSet.top();
+            if ((-curr_el_pair.first) > lowerBound && top_candidates.size() == ef) {
+                break;
+            }
+            candidateSet.pop();
+            tableint curNodeNum = curr_el_pair.second;
+
+            std::vector<tableint> neighbors = getConnectionsWithSharedLock(curNodeNum, layer);
+            for (tableint candidate_id : neighbors) {
+                if (visited_array[candidate_id] == visited_array_tag) continue;
+                visited_array[candidate_id] = visited_array_tag;
+                dist_t dist1 = fstdistfunc_(data_point, getDataByInternalId(candidate_id), dist_func_param_);
+                if (top_candidates.size() < ef || lowerBound > dist1) {
+                    candidateSet.emplace(-dist1, candidate_id);
+                    if (!isMarkedDeletedWithSharedLock(candidate_id))
+                        top_candidates.emplace(dist1, candidate_id);
+                    if (top_candidates.size() > ef)
+                        top_candidates.pop();
+                    if (!top_candidates.empty())
+                        lowerBound = top_candidates.top().first;
+                }
+            }
+        }
+        visited_list_pool_->releaseVisitedList(vl);
+        return top_candidates;
+    }
+
     // bare_bone_search means there is no check for deletions and stop condition is ignored in return of extra performance
     template <bool bare_bone_search = true, bool collect_metrics = false>
     std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
@@ -1643,8 +1697,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     #define APPROXIMATE_TWOHOP_DELETE 4
     #define REFACTOR_DELETE 5
 
-    bool supportsConcurrentTwoHopDelete(int deleteModel) const {
-        return deleteModel == TWOHOP_DELETE || deleteModel == APPROXIMATE_TWOHOP_DELETE;
+    bool supportsConcurrentDelete(int deleteModel) const {
+        return deleteModel == SEARCH_DELETE ||
+               deleteModel == TWOHOP_DELETE ||
+               deleteModel == APPROXIMATE_TWOHOP_DELETE;
     }
 
     std::vector<std::unique_lock<std::shared_mutex>> lockNodesUnique(
@@ -1859,12 +1915,149 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
     }
 
+    // Proposed edge changes for an online SEARCH_DELETE, computed lock-free in
+    // Phase 1 and applied under bounded ordered locks in Phase 2.
+    struct SearchRepairPlan {
+        // removal_by_level[level] = in-neighbors of the deleted node (they drop the edge to it)
+        std::vector<std::vector<tableint>> removal_by_level;
+        // additions[c][level] = list of (dist, thePoint): edges c -> thePoint to add
+        std::unordered_map<tableint, std::vector<std::vector<std::pair<dist_t, tableint>>>> additions;
+        std::vector<tableint> write_set;  // sorted, unique: every node whose forward list may change
+    };
+
+    // Phase 1 (no write locks): replicate the batch SEARCH_DELETE repair search.
+    // For each out-neighbor `thePoint` of the deleted node, search from thePoint
+    // and propose edges {candidate -> thePoint} so thePoint stays reachable. The
+    // search set is global, but the WRITE set is bounded by deg(D)*newLinkSize.
+    SearchRepairPlan buildSearchRepairPlan(tableint internalId, int newLinkSize) {
+        SearchRepairPlan plan;
+        int top_level = element_levels_[internalId];
+        plan.removal_by_level.assign(top_level + 1, {});
+        std::unordered_set<tableint> write_set;
+        write_set.insert(internalId);
+
+        for (int level = top_level; level >= 0; level--) {
+            std::vector<tableint> out_neighbors = getConnectionsWithSharedLock(internalId, level);
+            std::vector<tableint> in_neighbors = getReverseConnectionsWithSharedLock(internalId, level);
+            plan.removal_by_level[level] = in_neighbors;
+            write_set.insert(in_neighbors.begin(), in_neighbors.end());
+
+            for (tableint thePoint : out_neighbors) {
+                if (thePoint == internalId || thePoint >= cur_element_count) continue;
+                if (level > element_levels_[thePoint] || isMarkedDeletedWithSharedLock(thePoint)) continue;
+                // thePoint receives new in-edges; lock it in Phase 2 so the
+                // candidate->thePoint edges can't target a concurrently-deleted node.
+                write_set.insert(thePoint);
+
+                auto cand = searchLayerShared(thePoint, getDataByInternalId(thePoint), level, ef_construction_);
+                getNeighborsByHeuristic2(cand, newLinkSize);
+                while (!cand.empty()) {
+                    dist_t d = cand.top().first;
+                    tableint c = cand.top().second;
+                    cand.pop();
+                    if (c == thePoint || c == internalId || c >= cur_element_count) continue;
+                    if (level > element_levels_[c] || isMarkedDeletedWithSharedLock(c)) continue;
+                    auto &perLevel = plan.additions[c];
+                    if (perLevel.size() <= static_cast<size_t>(level)) perLevel.resize(level + 1);
+                    perLevel[level].emplace_back(d, thePoint);
+                    write_set.insert(c);
+                }
+            }
+        }
+
+        plan.write_set.assign(write_set.begin(), write_set.end());
+        std::sort(plan.write_set.begin(), plan.write_set.end());
+        return plan;
+    }
+
+    // Phase 2: lock the bounded write set in id order, re-validate against the
+    // current graph, apply removals + additions, and clear the tombstone's edges.
+    void commitSearchRepair(tableint internalId, SearchRepairPlan &plan, bool update_entrypoint) {
+        std::unique_lock<std::shared_mutex> metadata_lock(metadata_lock_, std::defer_lock);
+        if (update_entrypoint) {
+            metadata_lock.lock();
+        }
+        std::vector<std::unique_lock<std::shared_mutex>> node_locks = lockNodesUnique(plan.write_set);
+
+        if (update_entrypoint) {
+            updateEntrypointForConcurrentDeleteLocked(internalId, plan.write_set);
+        }
+
+        // 2a. Removal: drop the deleted node from each in-neighbor's forward list.
+        for (int level = 0; level < static_cast<int>(plan.removal_by_level.size()); level++) {
+            for (tableint X : plan.removal_by_level[level]) {
+                if (X == internalId || X >= cur_element_count) continue;
+                if (level > element_levels_[X] || isMarkedDeleted(X)) continue;
+                std::vector<tableint> cur = getConnectionsNoLock(X, level);
+                std::vector<tableint> updated;
+                updated.reserve(cur.size());
+                for (tableint n : cur) {
+                    if (n != internalId) updated.emplace_back(n);
+                }
+                if (updated.size() != cur.size()) {
+                    replaceConnectionsLocked(X, level, updated);
+                }
+            }
+        }
+
+        // 2b. Addition: apply candidate -> thePoint edges into each candidate's
+        // forward list, re-validated and degree-capped (mirrors mulLink).
+        for (auto &kv : plan.additions) {
+            tableint c = kv.first;
+            if (c == internalId || c >= cur_element_count || isMarkedDeleted(c)) continue;
+            std::vector<std::vector<std::pair<dist_t, tableint>>> &perLevel = kv.second;
+            for (int level = 0; level < static_cast<int>(perLevel.size()); level++) {
+                if (perLevel[level].empty() || level > element_levels_[c]) continue;
+                size_t Mcurmax = level ? maxM_ : maxM0_;
+                std::vector<tableint> cur = getConnectionsNoLock(c, level);
+                std::unordered_set<tableint> present(cur.begin(), cur.end());
+
+                std::vector<tableint> to_add;
+                for (std::pair<dist_t, tableint> &edge : perLevel[level]) {
+                    tableint thePoint = edge.second;
+                    if (thePoint == c || thePoint == internalId || thePoint >= cur_element_count) continue;
+                    if (level > element_levels_[thePoint] || isMarkedDeleted(thePoint)) continue;
+                    if (present.count(thePoint)) continue;
+                    present.insert(thePoint);
+                    to_add.emplace_back(thePoint);
+                }
+                if (to_add.empty()) continue;
+
+                std::vector<tableint> updated;
+                if (cur.size() + to_add.size() <= Mcurmax) {
+                    updated = cur;
+                    updated.insert(updated.end(), to_add.begin(), to_add.end());
+                } else {
+                    std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> cand;
+                    for (tableint n : cur) {
+                        cand.emplace(fstdistfunc_(getDataByInternalId(c), getDataByInternalId(n), dist_func_param_), n);
+                    }
+                    for (tableint n : to_add) {
+                        cand.emplace(fstdistfunc_(getDataByInternalId(c), getDataByInternalId(n), dist_func_param_), n);
+                    }
+                    getNeighborsByHeuristic2(cand, Mcurmax);
+                    while (!cand.empty()) {
+                        updated.emplace_back(cand.top().second);
+                        cand.pop();
+                    }
+                }
+                replaceConnectionsLocked(c, level, updated);
+            }
+        }
+
+        // 2c. Clear the tombstone's own forward edges (and its reverse contributions).
+        for (int level = element_levels_[internalId]; level >= 0; level--) {
+            std::vector<tableint> empty;
+            replaceConnectionsLocked(internalId, level, empty);
+        }
+    }
+
     void deletePointConcurrent(labeltype label, int deleteModel, int newLinkSize) {
 #ifdef COARSE_GLOBAL_LOCK
         std::lock_guard<std::mutex> coarse_lock(global_op_lock_);
 #endif
-        if (!supportsConcurrentTwoHopDelete(deleteModel)) {
-            throw std::runtime_error("Concurrent delete only supports TWOHOP_DELETE and APPROXIMATE_TWOHOP_DELETE");
+        if (!supportsConcurrentDelete(deleteModel)) {
+            throw std::runtime_error("Concurrent delete supports SEARCH_DELETE, TWOHOP_DELETE, APPROXIMATE_TWOHOP_DELETE");
         }
 
         std::unique_lock<std::mutex> lock_label(getLabelOpMutex(label));
@@ -1884,6 +2077,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         {
             std::unique_lock<std::shared_mutex> lock_table(label_lookup_lock);
             label_lookup_.erase(label);
+        }
+
+        if (deleteModel == SEARCH_DELETE) {
+            // Phase 1 (lock-free search) then Phase 2 (validated bounded commit).
+            SearchRepairPlan plan = buildSearchRepairPlan(internalId, newLinkSize);
+            commitSearchRepair(internalId, plan, update_entrypoint);
+            return;
         }
 
         std::vector<std::vector<tableint>> affected_by_level;
