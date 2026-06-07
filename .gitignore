@@ -2,3 +2,13 @@
 hnsw_Wolverine_test
 deleteList
 /index
+
+# build artifacts
+hnsw_Wolverine_interleaved_test
+hnsw_Wolverine_interleaved_baseline
+
+# benchmark outputs
+sweep_runs/
+sweep_results*.csv
+cwolverine-cmp-*.out
+cwolverine-cmp-*.err

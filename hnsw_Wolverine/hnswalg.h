@@ -51,6 +51,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     mutable std::vector<std::shared_mutex> link_list_locks_;
     mutable std::shared_mutex reverse_links_lock_;
 
+#ifdef COARSE_GLOBAL_LOCK
+    // Coarse-grained baseline: a single global mutex that serializes every public
+    // operation (search/insert/delete). Build with -DCOARSE_GLOBAL_LOCK to compare
+    // this "one big lock" design against the fine-grained scheme. The per-node and
+    // reverse-link locks below remain in place but are always uncontended in this mode.
+    mutable std::mutex global_op_lock_;
+#endif
+
     tableint enterpoint_node_{0};
 
     size_t size_links_level0_{0};
@@ -70,6 +78,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     std::unordered_map<labeltype, tableint> label_lookup_;
 
     std::default_random_engine level_generator_;
+    mutable std::mutex level_generator_lock_;  // guards level_generator_ against concurrent inserts
     std::default_random_engine update_probability_generator_;
 
     mutable std::atomic<long> metric_distance_computations{0};
@@ -383,6 +392,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     int getRandomLevel(double reverse_size) {
         std::uniform_real_distribution<double> distribution(0.0, 1.0);
+        std::lock_guard<std::mutex> lock(level_generator_lock_);
         double r = -log(distribution(level_generator_)) * reverse_size;
         return (int) r;
     }
@@ -1348,7 +1358,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::unique_lock<std::shared_mutex> node_lock(link_list_locks_[internalId]);
         if (!isMarkedDeleted(internalId)) {
             unsigned char *ll_cur = ((unsigned char *)get_linklist0(internalId))+2;
-            *ll_cur |= DELETE_MARK;
+            __atomic_or_fetch(ll_cur, DELETE_MARK, __ATOMIC_RELAXED);
             num_deleted_ += 1;
             if (allow_replace_deleted_) {
                 std::unique_lock <std::mutex> lock_deleted_elements(deleted_elements_lock);
@@ -1391,7 +1401,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::unique_lock<std::shared_mutex> node_lock(link_list_locks_[internalId]);
         if (isMarkedDeleted(internalId)) {
             unsigned char *ll_cur = ((unsigned char *)get_linklist0(internalId)) + 2;
-            *ll_cur &= ~DELETE_MARK;
+            __atomic_and_fetch(ll_cur, (unsigned char)~DELETE_MARK, __ATOMIC_RELAXED);
             num_deleted_ -= 1;
             if (allow_replace_deleted_) {
                 std::unique_lock <std::mutex> lock_deleted_elements(deleted_elements_lock);
@@ -1408,7 +1418,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     */
     bool isMarkedDeleted(tableint internalId) const {
         unsigned char *ll_cur = ((unsigned char*)get_linklist0(internalId)) + 2;
-        return *ll_cur & DELETE_MARK;
+        return __atomic_load_n(ll_cur, __ATOMIC_RELAXED) & DELETE_MARK;
     }
 
     unsigned short int getListCount(linklistsizeint * ptr) const {
@@ -1426,6 +1436,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     * If replacement of deleted elements is enabled: replaces previously deleted point if any, updating it with new point
     */
     void addPoint(const void *data_point, labeltype label, bool replace_deleted = false) {
+#ifdef COARSE_GLOBAL_LOCK
+        std::lock_guard<std::mutex> coarse_lock(global_op_lock_);
+#endif
         if ((allow_replace_deleted_ == false) && (replace_deleted == true)) {
             throw std::runtime_error("Replacement of deleted elements is disabled in constructor");
         }
@@ -1488,7 +1501,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
             memset(data_level0_memory_ + cur_c * size_data_per_element_ + offsetLevel0_, 0, size_data_per_element_);
             unsigned char *ll_cur = ((unsigned char *)get_linklist0(cur_c)) + 2;
-            *ll_cur |= DELETE_MARK;
+            __atomic_or_fetch(ll_cur, DELETE_MARK, __ATOMIC_RELAXED);
             num_deleted_ += 1;
 
             // Initialisation of the data and label
@@ -1560,7 +1573,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         {
             std::unique_lock<std::shared_mutex> lock_el(link_list_locks_[cur_c]);
             unsigned char *ll_cur = ((unsigned char *)get_linklist0(cur_c)) + 2;
-            *ll_cur &= ~DELETE_MARK;
+            __atomic_and_fetch(ll_cur, (unsigned char)~DELETE_MARK, __ATOMIC_RELAXED);
             num_deleted_ -= 1;
         }
         return cur_c;
@@ -1847,6 +1860,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
     void deletePointConcurrent(labeltype label, int deleteModel, int newLinkSize) {
+#ifdef COARSE_GLOBAL_LOCK
+        std::lock_guard<std::mutex> coarse_lock(global_op_lock_);
+#endif
         if (!supportsConcurrentTwoHopDelete(deleteModel)) {
             throw std::runtime_error("Concurrent delete only supports TWOHOP_DELETE and APPROXIMATE_TWOHOP_DELETE");
         }
@@ -2187,6 +2203,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     std::priority_queue<std::pair<dist_t, labeltype >>
     searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const {
+#ifdef COARSE_GLOBAL_LOCK
+        std::lock_guard<std::mutex> coarse_lock(global_op_lock_);
+#endif
         std::priority_queue<std::pair<dist_t, labeltype >> result;
         if (cur_element_count == 0) return result;
 
@@ -2216,6 +2235,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     std::priority_queue<std::pair<dist_t, labeltype >>
     searchKnn(const void *query_data, size_t k,vector<tableint>& visitedNodes, BaseFilterFunctor* isIdAllowed = nullptr) const {
+#ifdef COARSE_GLOBAL_LOCK
+        std::lock_guard<std::mutex> coarse_lock(global_op_lock_);
+#endif
         std::priority_queue<std::pair<dist_t, labeltype >> result;
         if (cur_element_count == 0) return result;
 

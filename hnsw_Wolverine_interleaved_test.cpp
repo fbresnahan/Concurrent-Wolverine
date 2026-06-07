@@ -535,6 +535,11 @@ int main(int argc, char **argv) {
 
     cout << "-----------------------------------------------------------------------------------\n";
     cout << "Interleaved benchmark\n";
+#ifdef COARSE_GLOBAL_LOCK
+    cout << "locking_mode: COARSE_GLOBAL_LOCK (single global mutex baseline)\n";
+#else
+    cout << "locking_mode: fine-grained\n";
+#endif
     cout << "M: " << config.M
          << " ef_construction: " << config.ef_construction
          << " ef_search: " << config.ef_search

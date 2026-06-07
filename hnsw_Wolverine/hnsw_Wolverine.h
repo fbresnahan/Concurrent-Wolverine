@@ -211,7 +211,7 @@ void creat_deleteList(vector<size_t>&deleteList,int pre_creat_sum,int list_len,d
         }
         pre_creat_sum*=2;
     }
-    random_shuffle(deleteList.begin(),deleteList.end());
+    std::shuffle(deleteList.begin(), deleteList.end(), random);
 }
 
 void write_Vector(vector<size_t> vec,string file_path){

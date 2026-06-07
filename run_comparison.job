@@ -1,0 +1,124 @@
+#!/bin/bash
+# =============================================================================
+# run_comparison.job — SLURM batch script for the CNSI cluster.
+#
+# Submits the fine-grained vs coarse-global-lock concurrency comparison and
+# sweeps thread counts up to the cores allocated on one node.
+#
+#   Submit with:   sbatch run_comparison.job
+#   Watch with:    squeue -u $USER      /     tail -f cwolverine-cmp-<jobid>.out
+#
+# NOTE: this is a CPU concurrency benchmark. It does NOT use GPUs. Request a
+#       CPU partition with as many cores as possible — do not add --gres=gpu.
+# =============================================================================
+
+#SBATCH --job-name=cwolverine-cmp
+#SBATCH --output=cwolverine-cmp-%j.out
+#SBATCH --error=cwolverine-cmp-%j.err
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --time=01:00:00
+#SBATCH --mem=32G
+#
+# -------- CLUSTER SETTINGS (CNSI) -------------------------------------------
+# CPU partitions on this cluster (from `sinfo -o "%P %c %m %N"`):
+#     batch*    40 cores/node   (default — used below)
+#     aws       96 cores/node   (best scaling demo; see the 96-core block below)
+#     largemem  40 cores/node   (only if you need 710 GB RAM — you don't)
+#     gpu       skip — this benchmark is CPU-only.
+#
+#SBATCH --partition=batch          # 40-core CPU node (account pod-users, qos normal)
+#SBATCH --cpus-per-task=40         # whole node
+#SBATCH --account=pod-users        # from `sacctmgr show assoc user=$USER`
+#
+# NOTE: your account (pod-users) is NOT authorized for the 96-core `aws`
+# partition, so we use `batch`. 40 cores is plenty to show the scaling story.
+# ----------------------------------------------------------------------------
+
+set -euo pipefail
+cd "${SLURM_SUBMIT_DIR:-.}"
+
+echo "================ environment ================"
+echo "Host:            $(hostname)"
+echo "Job ID:          ${SLURM_JOB_ID:-n/a}"
+echo "Allocated CPUs:  ${SLURM_CPUS_PER_TASK:-unknown}"
+echo "Date:            $(date)"
+
+# --- load a recent compiler (>= GCC 9 for C++17) ---------------------------
+# `module avail gcc` returned nothing on this cluster, so we (1) try the system
+# compiler first, and (2) only reach for modules if it's missing/too old.
+# If your site needs a specific module, set GCC_MODULE before sbatch, e.g.:
+#     sbatch --export=ALL,GCC_MODULE=gcc/12 run_comparison.job
+have_cxx17() { g++ -std=c++17 -x c++ -E - >/dev/null 2>&1 <<<'int main(){return 0;}'; }
+
+if ! command -v g++ >/dev/null 2>&1 || ! have_cxx17; then
+  echo "System g++ unusable; trying modules..."
+  if [ -n "${GCC_MODULE:-}" ]; then
+    module load "$GCC_MODULE" 2>/dev/null || true
+  else
+    # try a few common names (Lmod `module spider gcc` shows the real ones)
+    for m in gcc gnu gcc-toolset/12 gcc/12 gcc/11 gcc/10 gcc/9; do
+      module load "$m" 2>/dev/null && break || true
+    done
+  fi
+fi
+
+if ! command -v g++ >/dev/null 2>&1 || ! have_cxx17; then
+  echo "ERROR: no C++17-capable g++ found. Run 'module spider gcc' and set GCC_MODULE." >&2
+  exit 1
+fi
+echo "Compiler:        $(g++ --version | head -1)"
+echo "============================================"
+
+# --- build both variants ----------------------------------------------------
+# The repo Makefile already targets x86 with AVX2 + OpenMP, which the cluster
+# toolchain provides. `compare` builds the fine-grained binary and the
+# -DCOARSE_GLOBAL_LOCK baseline from the same source.
+#
+# (Optional) For AVX-512 nodes, append to CXXFLAGS for a faster distance kernel:
+#   make compare CXXFLAGS="-I. -std=c++17 -Ofast -pthread -fopenmp -D__AVX__ -D__AVX512F__ -mavx512f -DHNSW"
+make clean
+make compare
+
+# --- build the thread list up to the allocated core count -------------------
+NCORES="${SLURM_CPUS_PER_TASK:-8}"
+LIST=""
+for t in 1 2 4 8 16 32 64 128; do
+  if [ "$t" -le "$NCORES" ]; then LIST="$LIST $t"; fi
+done
+# always include the exact core count as the top data point
+case " $LIST " in *" $NCORES "*) : ;; *) LIST="$LIST $NCORES" ;; esac
+export THREADS="$LIST"
+
+# --- workload knobs (override here if desired) ------------------------------
+export INITIAL_ACTIVE="${INITIAL_ACTIVE:-60000}"
+export TOTAL_OPS="${TOTAL_OPS:-400000}"
+export SEARCH_W="${SEARCH_W:-80}"
+export INSERT_W="${INSERT_W:-10}"
+export DELETE_W="${DELETE_W:-10}"
+export DELETE_MODEL="${DELETE_MODEL:-3}"
+export OUT="sweep_results_${SLURM_JOB_ID:-local}.csv"
+
+echo "Thread sweep:    $THREADS"
+echo "Workload:        initial_active=$INITIAL_ACTIVE total_ops=$TOTAL_OPS mix=$SEARCH_W/$INSERT_W/$DELETE_W model=$DELETE_MODEL"
+echo
+
+bash ./sweep.sh
+
+echo
+echo "================ results ===================="
+cat "$OUT"
+echo "============================================="
+echo "CSV written to: $OUT"
+
+# =============================================================================
+# Finding your cluster's settings (run these on the login node before sbatch):
+#
+#   sinfo -s                          # partitions + node states
+#   sinfo -o "%P %c %m %N"            # partition, #CPUs/node, mem, node names
+#   module avail gcc                  # available GCC modules -> edit `module load`
+#   sacctmgr show assoc user=$USER format=account,partition,qos
+#                                     # your account/partition/QOS (if required)
+#
+# Then edit: --partition, --cpus-per-task, (and --account if needed) above.
+# =============================================================================
