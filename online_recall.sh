@@ -39,7 +39,7 @@ echo "Online recall: models=[$MODELS] threads=$THREADS total_ops=$TOTAL_OPS mix=
 for m in $MODELS; do
   out="$OUTDIR/online_recall_model${m}.csv"
   echo "== model $m ($(model_name "$m")) -> $out =="
-  "$BIN" --data "$DATA" --queries "$QUERIES" --results "$out" \
+  ${NUMACTL:-} "$BIN" --data "$DATA" --queries "$QUERIES" --results "$out" \
     --initial-active "$INITIAL_ACTIVE" --total-ops "$TOTAL_OPS" \
     --validation-interval "$VAL_INTERVAL" --validation-queries "$VAL_QUERIES" \
     --k "$K" --M "$M" --ef-construction "$EFC" --ef-search "$EFS" \

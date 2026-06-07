@@ -30,7 +30,7 @@ bench_run() {
   local tag="${impl}_t${threads}_m${sw}-${iw}-${dw}_r${run}"
   local log="$RUNDIR/${tag}.log"
 
-  if ! "$bin" \
+  if ! ${NUMACTL:-} "$bin" \
       --data "$DATA" --queries "$QUERIES" --results "$RUNDIR/${tag}.csv" \
       --initial-active "$INITIAL_ACTIVE" --total-ops "$TOTAL_OPS" \
       --validation-interval 0 --check-reverse-links 0 \

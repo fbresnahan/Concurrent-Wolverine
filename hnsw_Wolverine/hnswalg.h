@@ -49,7 +49,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     mutable std::shared_mutex metadata_lock_;
     mutable std::vector<std::shared_mutex> link_list_locks_;
-    mutable std::shared_mutex reverse_links_lock_;
+    // Reverse adjacency is guarded by a fixed bank of striped locks (keyed by the
+    // TARGET node id), so concurrent writers updating different nodes' reverse
+    // lists don't all serialize on one global mutex. Each add/remove/get touches
+    // exactly one target, so a single stripe is held at a time (leaf lock).
+    static const size_t REVERSE_LOCK_STRIPES = 4096;
+    mutable std::vector<std::shared_mutex> reverse_links_locks_ =
+        std::vector<std::shared_mutex>(REVERSE_LOCK_STRIPES);
 
 #ifdef COARSE_GLOBAL_LOCK
     // Coarse-grained baseline: a single global mutex that serializes every public
@@ -223,8 +229,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             while (changed) {
                 changed = false;
                 std::vector<tableint> neighbors = getConnectionsWithSharedLock(currObj, level);
+#ifdef COLLECT_METRICS
+                // These are global atomics; on the hot search path they cause
+                // cross-core/socket cache-line contention. Off by default.
                 metric_hops++;
                 metric_distance_computations += neighbors.size();
+#endif
 
                 for (tableint cand : neighbors) {
                     if (cand < 0 || cand > max_elements_)
@@ -270,11 +280,16 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return reverse_link_lists_[internalId][level];
     }
 
+    std::shared_mutex& reverseLockFor(tableint target) const {
+        return reverse_links_locks_[target & (REVERSE_LOCK_STRIPES - 1)];
+    }
+
     std::vector<tableint> getReverseConnectionsWithSharedLock(tableint internalId, int level) const {
-        std::shared_lock<std::shared_mutex> lock(reverse_links_lock_);
+        std::shared_lock<std::shared_mutex> lock(reverseLockFor(internalId));
         return getReverseConnectionsNoLock(internalId, level);
     }
 
+    // *NoLock helpers assume the caller already holds reverseLockFor(target).
     void addReverseLinkNoLock(tableint target, int level, tableint source) {
         ensureReverseLevelNoLock(target, level);
         std::vector<tableint> &reverse_neighbors = reverse_link_lists_[target][level];
@@ -293,19 +308,32 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             reverse_neighbors.end());
     }
 
-    void syncReverseLinksForSourceNoLock(
+    // Self-locking variants: each takes the TARGET's stripe (one lock at a time).
+    void addReverseLink(tableint target, int level, tableint source) {
+        std::unique_lock<std::shared_mutex> lock(reverseLockFor(target));
+        addReverseLinkNoLock(target, level, source);
+    }
+
+    void removeReverseLink(tableint target, int level, tableint source) {
+        std::unique_lock<std::shared_mutex> lock(reverseLockFor(target));
+        removeReverseLinkNoLock(target, level, source);
+    }
+
+    // Diff old->new and update each affected target's reverse list under its own
+    // stripe lock. No global reverse lock is held.
+    void syncReverseLinksForSource(
         tableint source,
         int level,
         const std::vector<tableint> &old_neighbors,
         const std::vector<tableint> &new_neighbors) {
         for (tableint old_neighbor : old_neighbors) {
             if (find(new_neighbors.begin(), new_neighbors.end(), old_neighbor) == new_neighbors.end()) {
-                removeReverseLinkNoLock(old_neighbor, level, source);
+                removeReverseLink(old_neighbor, level, source);
             }
         }
         for (tableint new_neighbor : new_neighbors) {
             if (find(old_neighbors.begin(), old_neighbors.end(), new_neighbor) == old_neighbors.end()) {
-                addReverseLinkNoLock(new_neighbor, level, source);
+                addReverseLink(new_neighbor, level, source);
             }
         }
     }
@@ -330,8 +358,18 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     void replaceConnectionsLocked(tableint internalId, int level, const std::vector<tableint> &neighbors) {
         std::vector<tableint> old_neighbors = getConnectionsNoLock(internalId, level);
         overwriteConnectionsNoLock(internalId, level, neighbors);
-        std::unique_lock<std::shared_mutex> reverse_lock(reverse_links_lock_);
-        syncReverseLinksForSourceNoLock(internalId, level, old_neighbors, neighbors);
+        syncReverseLinksForSource(internalId, level, old_neighbors, neighbors);
+    }
+
+    // Stop-the-world rebuild: take every reverse stripe (ascending order) before
+    // reassigning the reverse adjacency wholesale.
+    std::vector<std::unique_lock<std::shared_mutex>> lockAllReverseStripes() {
+        std::vector<std::unique_lock<std::shared_mutex>> locks;
+        locks.reserve(REVERSE_LOCK_STRIPES);
+        for (size_t s = 0; s < REVERSE_LOCK_STRIPES; s++) {
+            locks.emplace_back(reverse_links_locks_[s]);
+        }
+        return locks;
     }
 
     void rebuildReverseAdjacency() {
@@ -343,7 +381,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
         }
 
-        std::unique_lock<std::shared_mutex> reverse_lock(reverse_links_lock_);
+        std::vector<std::unique_lock<std::shared_mutex>> reverse_locks = lockAllReverseStripes();
         reverse_link_lists_.assign(max_elements_, std::vector<std::vector<tableint>>(1));
         for (tableint internalId = 0; internalId < cur_element_count; internalId++) {
             reverse_link_lists_[internalId].resize(element_levels_[internalId] + 1);
@@ -1061,12 +1099,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 }
             }
 
-            std::unique_lock<std::shared_mutex> reverse_lock(reverse_links_lock_);
             for (tableint node_id : write_set) {
                 if (level > element_levels_[node_id]) {
                     continue;
                 }
-                syncReverseLinksForSourceNoLock(
+                syncReverseLinksForSource(
                     node_id,
                     level,
                     old_neighbors_by_node[node_id],
@@ -1151,8 +1188,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
 
             std::vector<tableint> new_neighbors = getConnectionsNoLock(selectedNeighbors[idx], level);
-            std::unique_lock<std::shared_mutex> reverse_lock(reverse_links_lock_);
-            syncReverseLinksForSourceNoLock(selectedNeighbors[idx], level, old_neighbors, new_neighbors);
+            syncReverseLinksForSource(selectedNeighbors[idx], level, old_neighbors, new_neighbors);
         }
         return next_closest_entry_point;
     }
@@ -1584,7 +1620,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     while (changed) {
                         changed = false;
                         unsigned int *data;
-                        std::unique_lock<std::shared_mutex> lock(link_list_locks_[currObj]);
+                        // Read-only descent: a shared lock is enough and lets
+                        // concurrent searches proceed instead of being blocked.
+                        std::shared_lock<std::shared_mutex> lock(link_list_locks_[currObj]);
                         data = get_linklist(currObj, level);
                         int size = getListCount(data);
 
@@ -1609,8 +1647,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 if (level > maxlevelcopy || level < 0)  // possible?
                     throw std::runtime_error("Level error");
 
-                std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates = searchBaseLayer(
-                        currObj, data_point, level);
+                // Use the shared-lock search (instead of searchBaseLayer's unique
+                // locks) so inserts don't block concurrent queries during the
+                // candidate-gathering traversal. Edges are still written under
+                // unique locks in mutuallyConnectNewElement.
+                std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates = searchLayerShared(
+                        currObj, data_point, level, ef_construction_);
                 currObj = mutuallyConnectNewElement(data_point, cur_c, top_candidates, level, false,true);
             }
         } else {
@@ -2156,8 +2198,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             setListCount(thePoint_data, thePoint_size);
         }
         std::vector<tableint> new_neighbors = getConnectionsNoLock(thePoint, level);
-        std::unique_lock<std::shared_mutex> reverse_lock(reverse_links_lock_);
-        syncReverseLinksForSourceNoLock(thePoint, level, old_neighbors, new_neighbors);
+        syncReverseLinksForSource(thePoint, level, old_neighbors, new_neighbors);
     }
 
     void patchDelete(vector<labeltype>deleteList,int deleteModel,int newLinkSize,int num_threads){

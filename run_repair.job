@@ -32,6 +32,11 @@ fi
 command -v g++ >/dev/null 2>&1 && have_cxx17 || { echo "ERROR: no C++17 g++" >&2; exit 1; }
 echo "Compiler: $(g++ --version | head -1)"
 
+# NUMA interleave across sockets (A/B with --export=ALL,NUMA_INTERLEAVE=0)
+if [ "${NUMA_INTERLEAVE:-1}" = "1" ] && command -v numactl >/dev/null 2>&1; then
+  export NUMACTL="numactl --interleave=all"; else export NUMACTL=""; fi
+echo "NUMA wrapper: '${NUMACTL:-<none>}'"
+
 make interleaved
 
 NCORES="${SLURM_CPUS_PER_TASK:-8}"
