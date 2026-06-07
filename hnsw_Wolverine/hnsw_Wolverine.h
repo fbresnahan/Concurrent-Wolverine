@@ -243,6 +243,11 @@ template <typename dist_t>
 double deleteIndex(hnswlib::HierarchicalNSW<dist_t>* alg_hnsw,vector<size_t> deleteList,int delete_model,int num_threads,int newLinkSize){
     struct timeval delete_start_time,delete_end_time;
     double delete_time=0;
+    // RECALL_QUALITY: route ALL models through the batch patchDelete path, which
+    // recycles internal ids (so repeated delete+re-add rounds don't exhaust the
+    // index) and implements the same repair per model. Used by the recall
+    // experiment to compare repair quality across models on equal footing.
+#ifndef RECALL_QUALITY
     if (delete_model == TWOHOP_DELETE ||
         delete_model == APPROXIMATE_TWOHOP_DELETE) {
         gettimeofday(&delete_start_time,NULL);
@@ -253,6 +258,7 @@ double deleteIndex(hnswlib::HierarchicalNSW<dist_t>* alg_hnsw,vector<size_t> del
         delete_time=(double)(delete_end_time.tv_sec-delete_start_time.tv_sec)+(double)(delete_end_time.tv_usec-delete_start_time.tv_usec)/1000000;
         return deleteList.size()/delete_time;
     }
+#endif
     #ifdef mulThreadsDelete
     gettimeofday(&delete_start_time,NULL);
     alg_hnsw->patchDelete(deleteList,delete_model,newLinkSize,num_threads);

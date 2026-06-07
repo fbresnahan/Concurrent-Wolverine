@@ -6,10 +6,12 @@ deleteList
 # build artifacts
 hnsw_Wolverine_interleaved_test
 hnsw_Wolverine_interleaved_baseline
+hnsw_Wolverine_recall
 
 # benchmark outputs
 sweep_runs/
 bench_runs/
+recall_results/
 sweep_results*.csv
 mix_results*.csv
 *.png
