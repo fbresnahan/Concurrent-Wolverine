@@ -394,7 +394,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
     bool isMarkedDeletedWithSharedLock(tableint internalId) const {
-        std::shared_lock<std::shared_mutex> lock(link_list_locks_[internalId]);
+        // The DELETE_MARK flag is a relaxed-atomic byte (see isMarkedDeleted), so
+        // reading it needs no lock. This used to take a shared link-list lock per
+        // call; on the search hot path (one call per visited candidate once any
+        // tombstone exists) that lock dominated multi-thread throughput.
         return isMarkedDeleted(internalId);
     }
 
