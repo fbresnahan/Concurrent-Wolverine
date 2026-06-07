@@ -1,0 +1,68 @@
+#!/bin/bash
+# =============================================================================
+# run_recall.job — SLURM batch script for the recall/repair-quality experiment.
+#
+#   sbatch run_recall.job
+#   tail -f cwolverine-recall-<jobid>.out
+#
+# Compares how well each delete model's repair preserves recall across repeated
+# delete+re-add churn rounds. Quality only (CPU; no GPU). All models run through
+# the id-recycling batch path (the binary is built with -DRECALL_QUALITY).
+# =============================================================================
+
+#SBATCH --job-name=cwolverine-recall
+#SBATCH --output=cwolverine-recall-%j.out
+#SBATCH --error=cwolverine-recall-%j.err
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --time=01:00:00
+#SBATCH --mem=32G
+#SBATCH --partition=batch
+#SBATCH --cpus-per-task=40
+#SBATCH --account=pod-users
+
+set -euo pipefail
+cd "${SLURM_SUBMIT_DIR:-.}"
+
+echo "Host: $(hostname)  CPUs: ${SLURM_CPUS_PER_TASK:-?}  Job: ${SLURM_JOB_ID:-n/a}"
+
+# --- compiler (system g++ if it does C++17, else try modules) ---------------
+have_cxx17() { g++ -std=c++17 -x c++ -E - >/dev/null 2>&1 <<<'int main(){return 0;}'; }
+module purge 2>/dev/null || true
+if ! command -v g++ >/dev/null 2>&1 || ! have_cxx17; then
+  if [ -n "${GCC_MODULE:-}" ]; then module load "$GCC_MODULE" 2>/dev/null || true
+  else for m in gcc gnu gcc-toolset/12 gcc/12 gcc/11 gcc/10 gcc/9; do module load "$m" 2>/dev/null && break || true; done
+  fi
+fi
+command -v g++ >/dev/null 2>&1 && have_cxx17 || { echo "ERROR: no C++17 g++ (run 'module spider gcc', set GCC_MODULE)" >&2; exit 1; }
+echo "Compiler: $(g++ --version | head -1)"
+
+# --- build the recall binary ------------------------------------------------
+make recall
+
+# --- run the experiment -----------------------------------------------------
+export THREADS="${SLURM_CPUS_PER_TASK:-8}"   # threads for build/search/batch-delete
+export MODELS="${MODELS:-1 2 3 4}"           # 2=Wolverine(search) 3=two-hop 4=approx
+export ROUNDS="${ROUNDS:-50}"
+export DRATE="${DRATE:-0.01}"
+export OUTDIR="recall_results_${SLURM_JOB_ID:-local}"
+
+echo "### Recall experiment: models=[$MODELS] rounds=$ROUNDS drate=$DRATE ###"
+bash ./recall_experiment.sh
+
+# --- plot (optional) --------------------------------------------------------
+if command -v python3 >/dev/null 2>&1 && python3 -c "import matplotlib" 2>/dev/null; then
+  python3 plot_recall.py "$OUTDIR" -o "${OUTDIR}/recall.png" || true
+else
+  echo "(matplotlib not available — copy $OUTDIR locally and run plot_recall.py)"
+fi
+
+echo
+echo "================ recall summary ===================="
+for f in "$OUTDIR"/recall_model*.csv; do
+  [ -f "$f" ] || continue
+  printf "%-32s start=%s end=%s\n" "$(basename "$f")" \
+    "$(awk -F, 'NR==2{print $1}' "$f")" "$(awk -F, 'END{print $1}' "$f")"
+done
+echo "===================================================="
+echo "CSVs + PNG in: $OUTDIR/"
