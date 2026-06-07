@@ -18,7 +18,7 @@
 : "${RUNDIR:=./bench_runs}"
 
 bench_header() {
-  echo "impl,threads,mix,run,search_throughput,insert_throughput,delete_throughput,search_p50_ms,search_p95_ms,search_p99_ms,insert_p99_ms,delete_p99_ms,recall,invalid_labels"
+  echo "impl,model,threads,mix,run,search_throughput,insert_throughput,delete_throughput,search_p50_ms,search_p95_ms,search_p99_ms,insert_p99_ms,delete_p99_ms,recall,invalid_labels"
 }
 
 _tp()  { sed -nE 's/.*throughput: ([0-9.]+).*/\1/p' <<<"$1"; }            # throughput from a line
@@ -55,7 +55,7 @@ bench_run() {
   recall=$(sed -nE 's/.*recall: ([0-9.]+).*/\1/p' <<<"$final")
   inval=$(sed -nE 's/.*invalid_labels: ([0-9]+).*/\1/p' <<<"$final")
 
-  echo "${impl},${threads},${sw}/${iw}/${dw},${run},${s_tp:-0},${i_tp:-0},${d_tp:-0},${s50:-0},${s95:-0},${s99:-0},${i99:-0},${d99:-0},${recall:-0},${inval:-0}" >> "$OUT"
-  printf "  %-7s t=%-3s mix=%-9s r%s  search=%-10s ops/s  p99=%-7s ms  recall=%s\n" \
-    "$impl" "$threads" "${sw}/${iw}/${dw}" "$run" "${s_tp:-0}" "${s99:-0}" "${recall:-0}"
+  echo "${impl},${DELETE_MODEL},${threads},${sw}/${iw}/${dw},${run},${s_tp:-0},${i_tp:-0},${d_tp:-0},${s50:-0},${s95:-0},${s99:-0},${i99:-0},${d99:-0},${recall:-0},${inval:-0}" >> "$OUT"
+  printf "  %-7s m%s t=%-3s mix=%-9s r%s  search=%-9s ops/s  del_tp=%-8s del_p99=%-7s recall=%s\n" \
+    "$impl" "${DELETE_MODEL}" "$threads" "${sw}/${iw}/${dw}" "$run" "${s_tp:-0}" "${d_tp:-0}" "${d99:-0}" "${recall:-0}"
 }

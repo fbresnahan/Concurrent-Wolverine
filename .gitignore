@@ -12,8 +12,12 @@ hnsw_Wolverine_recall
 sweep_runs/
 bench_runs/
 recall_results/
+online_recall_results/
+online_recall_*/
 sweep_results*.csv
 mix_results*.csv
+repair_sweep*.csv
+repair_mix*.csv
 *.png
-cwolverine-cmp-*.out
-cwolverine-cmp-*.err
+cwolverine-*.out
+cwolverine-*.err

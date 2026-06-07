@@ -1,0 +1,67 @@
+#!/bin/bash
+# =============================================================================
+# run_repair.job — repair-method comparison (SEARCH vs TWO-HOP vs APPROX),
+# all using fine-grained online locking. Covers E2 (thread scaling), E3 (mix),
+# and E4 (online recall). CPU-only.
+#
+#   sbatch run_repair.job ; tail -f cwolverine-repair-<jobid>.out
+# =============================================================================
+#SBATCH --job-name=cwolverine-repair
+#SBATCH --output=cwolverine-repair-%j.out
+#SBATCH --error=cwolverine-repair-%j.err
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --time=03:00:00
+#SBATCH --mem=32G
+#SBATCH --partition=batch
+#SBATCH --cpus-per-task=40
+#SBATCH --account=pod-users
+
+set -euo pipefail
+cd "${SLURM_SUBMIT_DIR:-.}"
+echo "Host: $(hostname)  CPUs: ${SLURM_CPUS_PER_TASK:-?}  Job: ${SLURM_JOB_ID:-n/a}"
+
+# --- compiler ---------------------------------------------------------------
+have_cxx17() { g++ -std=c++17 -x c++ -E - >/dev/null 2>&1 <<<'int main(){return 0;}'; }
+module purge 2>/dev/null || true
+if ! command -v g++ >/dev/null 2>&1 || ! have_cxx17; then
+  if [ -n "${GCC_MODULE:-}" ]; then module load "$GCC_MODULE" 2>/dev/null || true
+  else for m in gcc gnu gcc-toolset/12 gcc/12 gcc/11 gcc/10 gcc/9; do module load "$m" 2>/dev/null && break || true; done
+  fi
+fi
+command -v g++ >/dev/null 2>&1 && have_cxx17 || { echo "ERROR: no C++17 g++" >&2; exit 1; }
+echo "Compiler: $(g++ --version | head -1)"
+
+make interleaved
+
+NCORES="${SLURM_CPUS_PER_TASK:-8}"
+LIST=""; for t in 1 2 4 8 16 32 64; do [ "$t" -le "$NCORES" ] && LIST="$LIST $t"; done
+case " $LIST " in *" $NCORES "*) : ;; *) LIST="$LIST $NCORES" ;; esac
+JID="${SLURM_JOB_ID:-local}"
+export REPEATS="${REPEATS:-3}"
+export FINE_BIN=./hnsw_Wolverine_interleaved_test
+plot() { python3 -c "import matplotlib" 2>/dev/null && python3 "$@" || echo "(matplotlib missing; plot $* later)"; }
+
+# === E2: repair-method thread scaling (fine; search vs two-hop vs approx) ====
+echo "### E2: repair-method thread scaling ###"
+IMPLS=fine MODELS="2 3 4" THREADS="$LIST" \
+  INITIAL_ACTIVE=40000 TOTAL_OPS=200000 SEARCH_W=80 INSERT_W=10 DELETE_W=10 \
+  OUT="repair_sweep_${JID}.csv" bash ./sweep.sh
+plot plot_sweep.py "repair_sweep_${JID}.csv" -o "repair_sweep_${JID}.png"
+
+# === E3: repair-method workload-mix sweep (fine) ============================
+echo "### E3: repair-method mix sweep ###"
+IMPLS=fine MODELS="2 3 4" MIX_THREADS="$NCORES" \
+  OUT="repair_mix_${JID}.csv" bash ./mix_sweep.sh
+plot plot_mix.py "repair_mix_${JID}.csv" -o "repair_mix_${JID}.png"
+
+# === E4: online recall trajectory (fine; search vs two-hop vs approx) =======
+echo "### E4: online recall ###"
+MODELS="2 3 4" THREADS="$NCORES" TOTAL_OPS=600000 VAL_INTERVAL=30000 VAL_QUERIES=200 \
+  OUTDIR="online_recall_${JID}" bash ./online_recall.sh
+plot plot_online_recall.py "online_recall_${JID}" -o "online_recall_${JID}/online_recall.png"
+
+echo
+echo "================ outputs ===================="
+echo "E2: repair_sweep_${JID}.csv/.png    E3: repair_mix_${JID}.csv/.png"
+echo "E4: online_recall_${JID}/online_recall_model*.csv + online_recall.png"
