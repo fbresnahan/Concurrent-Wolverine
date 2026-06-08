@@ -1,8 +1,8 @@
 #!/bin/bash
 # =============================================================================
 # run_recall_mix.job — RECALL vs WRITE FRACTION for two-hop (3), approx (4),
-# and naive reconstruction (7). Produces one graph: recall vs write fraction, one
-# line per delete model. Runs at 40 threads. CPU-only.
+# naive tombstone (6), and naive reconstruction (7). Produces one graph: recall
+# vs write fraction, one line per delete model. Runs at 40 threads. CPU-only.
 #
 #   sbatch run_recall_mix.job ; tail -f cwolverine-recallmix-<jobid>.out
 #
@@ -39,10 +39,13 @@ if [ "${NUMA_INTERLEAVE:-1}" = "1" ] && command -v numactl >/dev/null 2>&1; then
   export NUMACTL="numactl --interleave=all"; else export NUMACTL=""; fi
 echo "NUMA wrapper: '${NUMACTL:-<none>}'"
 
+# IMPORTANT: rebuild from scratch so a stale binary can't mask source changes.
+make clean
 make interleaved
 
 JID="${SLURM_JOB_ID:-local}"
-export MODELS="${MODELS:-3 4 7}"
+# 3=two-hop(fixed), 4=approx, 6=naive-tombstone, 7=naive-reconstruction
+export MODELS="${MODELS:-3 4 6 7}"
 export WRITE_FRACS="${WRITE_FRACS:-0 20 40 60 80}"
 export THREADS="${THREADS:-40}"
 export INITIAL_ACTIVE="${INITIAL_ACTIVE:-10000}"

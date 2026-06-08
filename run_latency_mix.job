@@ -36,6 +36,8 @@ if [ "${NUMA_INTERLEAVE:-1}" = "1" ] && command -v numactl >/dev/null 2>&1; then
   export NUMACTL="numactl --interleave=all"; else export NUMACTL=""; fi
 echo "NUMA wrapper: '${NUMACTL:-<none>}'"
 
+# IMPORTANT: rebuild from scratch so a stale binary can't mask source changes.
+make clean
 make interleaved
 
 JID="${SLURM_JOB_ID:-local}"
