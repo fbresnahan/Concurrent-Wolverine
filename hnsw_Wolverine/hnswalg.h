@@ -1817,60 +1817,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return neighborhood_ids;
     }
 
-    std::vector<tableint> buildTwoHopRepairNeighborsLocked(
-        tableint source,
-        tableint deletedId,
-        int level,
-        int newLinkSize,
-        const std::unordered_set<tableint> &locked_nodes) {
-        size_t Mcurmax = level ? maxM_ : maxM0_;
-        size_t candidate_limit = std::max(static_cast<size_t>(newLinkSize) * 5, Mcurmax);
-        std::unordered_set<tableint> candidate_ids;
-        std::vector<tableint> current_neighbors = getConnectionsNoLock(source, level);
-        std::vector<tableint> live_neighbors;
-
-        for (tableint neighbor : current_neighbors) {
-            if (neighbor == deletedId || neighbor == source || isMarkedDeleted(neighbor)) {
-                continue;
-            }
-            candidate_ids.emplace(neighbor);
-            live_neighbors.emplace_back(neighbor);
-        }
-
-        for (tableint one_hop : live_neighbors) {
-            if (!locked_nodes.count(one_hop) || level > element_levels_[one_hop]) {
-                continue;
-            }
-            std::vector<tableint> two_hop_neighbors = getConnectionsNoLock(one_hop, level);
-            for (tableint two_hop : two_hop_neighbors) {
-                if (two_hop == deletedId || two_hop == source || isMarkedDeleted(two_hop)) {
-                    continue;
-                }
-                candidate_ids.emplace(two_hop);
-                if (candidate_ids.size() >= candidate_limit) {
-                    break;
-                }
-            }
-            if (candidate_ids.size() >= candidate_limit) {
-                break;
-            }
-        }
-
-        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidates;
-        for (tableint candidate : candidate_ids) {
-            candidates.emplace(
-                fstdistfunc_(getDataByInternalId(source), getDataByInternalId(candidate), dist_func_param_),
-                candidate);
-        }
-
-        getNeighborsByHeuristic2(candidates, Mcurmax);
-        std::vector<tableint> new_neighbors;
-        while (!candidates.empty()) {
-            new_neighbors.emplace_back(candidates.top().second);
-            candidates.pop();
-        }
-        return new_neighbors;
-    }
+    // (The previous buildTwoHopRepairNeighborsLocked — which repaired the deleted
+    // node's IN-neighbors by REPLACING their lists with their own 2-hop set — has
+    // been removed. TWOHOP_DELETE now uses buildTwoHopRepairPlan + commitSearchRepair,
+    // which is faithful to the batch original: anchored on the deleted node's
+    // out-neighbors and applied additively. See deletePointConcurrent.)
 
     // Naive reconstruction repair for one affected in-neighbor `source` of the
     // deleted node. The candidate pool is just (a) source's own surviving
@@ -2078,6 +2029,83 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return plan;
     }
 
+    // Candidate generator for the faithful TWO-HOP repair: thePoint's 2-hop
+    // neighborhood (the union of thePoint's neighbors' neighbors), as a max-heap
+    // keyed by distance to thePoint and heuristic-pruned to newLinkSize. This
+    // mirrors the batch TWOHOP_DELETE candidate selection in
+    // patchDeleteInternalDeleteList (predict_list capped at 5*newLinkSize, then
+    // getNeighborsByHeuristic2). Read-only: shared locks only.
+    std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
+    twoHopCandidatesShared(tableint thePoint, tableint deletedId, int level, int newLinkSize) {
+        std::unordered_set<tableint> predict_list;
+        const size_t cap = static_cast<size_t>(newLinkSize) * 5;
+        std::vector<tableint> one_hop = getConnectionsWithSharedLock(thePoint, level);
+        for (tableint oneHopPoint : one_hop) {
+            if (oneHopPoint >= cur_element_count) continue;
+            std::vector<tableint> two_hop = getConnectionsWithSharedLock(oneHopPoint, level);
+            for (tableint twoHopPoint : two_hop) {
+                if (twoHopPoint == thePoint || twoHopPoint == deletedId || twoHopPoint >= cur_element_count) continue;
+                if (isMarkedDeletedWithSharedLock(twoHopPoint)) continue;
+                predict_list.emplace(twoHopPoint);
+                if (predict_list.size() >= cap) break;
+            }
+            if (predict_list.size() >= cap) break;
+        }
+
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidates;
+        for (tableint p : predict_list) {
+            candidates.emplace(
+                fstdistfunc_(getDataByInternalId(thePoint), getDataByInternalId(p), dist_func_param_), p);
+        }
+        getNeighborsByHeuristic2(candidates, newLinkSize);
+        return candidates;
+    }
+
+    // Phase 1 of the faithful TWO-HOP repair. Identical in shape to
+    // buildSearchRepairPlan (anchored on the deleted node's out-neighbors,
+    // proposes additive candidate->thePoint edges, removes the deleted node from
+    // its in-neighbors), but candidates come from thePoint's 2-hop neighborhood
+    // instead of a graph search. Reuses commitSearchRepair to apply, so the
+    // application is ADDITIVE + degree-capped exactly like the batch original's
+    // mulLink (not the replace-the-list behavior of the old implementation).
+    SearchRepairPlan buildTwoHopRepairPlan(tableint internalId, int newLinkSize) {
+        SearchRepairPlan plan;
+        int top_level = element_levels_[internalId];
+        plan.removal_by_level.assign(top_level + 1, {});
+        std::unordered_set<tableint> write_set;
+        write_set.insert(internalId);
+
+        for (int level = top_level; level >= 0; level--) {
+            std::vector<tableint> out_neighbors = getConnectionsWithSharedLock(internalId, level);
+            std::vector<tableint> in_neighbors = getReverseConnectionsWithSharedLock(internalId, level);
+            plan.removal_by_level[level] = in_neighbors;
+            write_set.insert(in_neighbors.begin(), in_neighbors.end());
+
+            for (tableint thePoint : out_neighbors) {
+                if (thePoint == internalId || thePoint >= cur_element_count) continue;
+                if (level > element_levels_[thePoint] || isMarkedDeletedWithSharedLock(thePoint)) continue;
+                write_set.insert(thePoint);
+
+                auto cand = twoHopCandidatesShared(thePoint, internalId, level, newLinkSize);
+                while (!cand.empty()) {
+                    dist_t d = cand.top().first;
+                    tableint c = cand.top().second;
+                    cand.pop();
+                    if (c == thePoint || c == internalId || c >= cur_element_count) continue;
+                    if (level > element_levels_[c] || isMarkedDeletedWithSharedLock(c)) continue;
+                    auto &perLevel = plan.additions[c];
+                    if (perLevel.size() <= static_cast<size_t>(level)) perLevel.resize(level + 1);
+                    perLevel[level].emplace_back(d, thePoint);
+                    write_set.insert(c);
+                }
+            }
+        }
+
+        plan.write_set.assign(write_set.begin(), write_set.end());
+        std::sort(plan.write_set.begin(), plan.write_set.end());
+        return plan;
+    }
+
     // Phase 2: lock the bounded write set in id order, re-validate against the
     // current graph, apply removals + additions, and clear the tombstone's edges.
     void commitSearchRepair(tableint internalId, SearchRepairPlan &plan, bool update_entrypoint) {
@@ -2203,6 +2231,16 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             return;
         }
 
+        if (deleteModel == TWOHOP_DELETE) {
+            // Faithful to the batch original: anchored on the deleted node's
+            // out-neighbors, candidates from their 2-hop neighborhood, applied
+            // ADDITIVELY (commitSearchRepair, like mulLink) rather than replacing
+            // the in-neighbors' lists.
+            SearchRepairPlan plan = buildTwoHopRepairPlan(internalId, newLinkSize);
+            commitSearchRepair(internalId, plan, update_entrypoint);
+            return;
+        }
+
         std::vector<std::vector<tableint>> affected_by_level;
         std::vector<tableint> neighborhood = collectConcurrentDeleteNeighborhood(internalId, deleteModel, affected_by_level);
         std::unordered_set<tableint> locked_node_set(neighborhood.begin(), neighborhood.end());
@@ -2226,11 +2264,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     continue;
                 }
 
+                // Only APPROXIMATE_TWOHOP_DELETE and NAIVE_RECONSTRUCTION_DELETE
+                // use this replace-the-in-neighbor's-list path now; TWOHOP_DELETE
+                // and SEARCH_DELETE return earlier via the additive plan/commit.
                 std::vector<tableint> repaired_neighbors;
-                if (deleteModel == TWOHOP_DELETE) {
-                    repaired_neighbors = buildTwoHopRepairNeighborsLocked(
-                        affected, internalId, level, newLinkSize, locked_node_set);
-                } else if (deleteModel == NAIVE_RECONSTRUCTION_DELETE) {
+                if (deleteModel == NAIVE_RECONSTRUCTION_DELETE) {
                     repaired_neighbors = buildNaiveReconstructionNeighborsLocked(
                         affected, internalId, level, newLinkSize, locked_node_set);
                 } else {
