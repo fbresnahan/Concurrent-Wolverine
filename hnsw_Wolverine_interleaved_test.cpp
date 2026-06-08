@@ -452,7 +452,7 @@ void printHelp(const char *program_name) {
     cout << "  --search-weight N\n";
     cout << "  --insert-weight N\n";
     cout << "  --delete-weight N\n";
-    cout << "  --delete-model N (3 for TWOHOP_DELETE, 4 for APPROXIMATE_TWOHOP_DELETE)\n";
+    cout << "  --delete-model N (2 SEARCH, 3 TWOHOP, 4 APPROX_TWOHOP, 6 NAIVE_TOMBSTONE, 7 NAIVE_RECONSTRUCTION)\n";
     cout << "  --new-link-size N\n";
     cout << "  --check-reverse-links 0|1\n";
     cout << "  --seed N\n";
@@ -505,8 +505,10 @@ int main(int argc, char **argv) {
     Config config = parsed.config;
     if (config.delete_model != SEARCH_DELETE &&
         config.delete_model != TWOHOP_DELETE &&
-        config.delete_model != APPROXIMATE_TWOHOP_DELETE) {
-        throw runtime_error("interleaved benchmark supports SEARCH_DELETE(2), TWOHOP_DELETE(3), APPROXIMATE_TWOHOP_DELETE(4)");
+        config.delete_model != APPROXIMATE_TWOHOP_DELETE &&
+        config.delete_model != NAIVE_TOMBSTONE_DELETE &&
+        config.delete_model != NAIVE_RECONSTRUCTION_DELETE) {
+        throw runtime_error("interleaved benchmark supports SEARCH_DELETE(2), TWOHOP_DELETE(3), APPROXIMATE_TWOHOP_DELETE(4), NAIVE_TOMBSTONE(6), NAIVE_RECONSTRUCTION(7)");
     }
 
     int32_t dim = 0;

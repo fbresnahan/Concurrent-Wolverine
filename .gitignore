@@ -18,6 +18,10 @@ sweep_results*.csv
 mix_results*.csv
 repair_sweep*.csv
 repair_mix*.csv
+recall_vs_mix*.csv
+recall_vs_mix_runs*/
+latency_vs_mix*.csv
+latency_vs_mix_runs*/
 *.png
 cwolverine-*.out
 cwolverine-*.err

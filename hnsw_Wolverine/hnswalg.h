@@ -1741,11 +1741,24 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     #define TWOHOP_DELETE 3
     #define APPROXIMATE_TWOHOP_DELETE 4
     #define REFACTOR_DELETE 5
+    // Soft delete only: tombstone the node and drop its label, but do NO graph
+    // repair. The dead node stays in the graph as a router (its out-edges are
+    // left intact) and is filtered from results via isMarkedDeleted. This is the
+    // classic hnswlib "markDelete" behavior — our baseline for recall vs churn.
+    #define NAIVE_TOMBSTONE_DELETE 6
+    // Naive reconstruction: when X is deleted, connect X's neighbors directly to
+    // each other (then drop X). It patches the hole but, unlike two-hop/approx,
+    // makes no attempt to pick connections that restore the monotonic search
+    // path — it just wires the immediate neighbors together. Online baseline for
+    // recall vs a path-aware repair.
+    #define NAIVE_RECONSTRUCTION_DELETE 7
 
     bool supportsConcurrentDelete(int deleteModel) const {
         return deleteModel == SEARCH_DELETE ||
                deleteModel == TWOHOP_DELETE ||
-               deleteModel == APPROXIMATE_TWOHOP_DELETE;
+               deleteModel == APPROXIMATE_TWOHOP_DELETE ||
+               deleteModel == NAIVE_TOMBSTONE_DELETE ||
+               deleteModel == NAIVE_RECONSTRUCTION_DELETE;
     }
 
     std::vector<std::unique_lock<std::shared_mutex>> lockNodesUnique(
@@ -1855,6 +1868,56 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         while (!candidates.empty()) {
             new_neighbors.emplace_back(candidates.top().second);
             candidates.pop();
+        }
+        return new_neighbors;
+    }
+
+    // Naive reconstruction repair for one affected in-neighbor `source` of the
+    // deleted node. The candidate pool is just (a) source's own surviving
+    // neighbors with the edge to X dropped, and (b) X's direct neighbors — i.e.
+    // "connect X's neighbors to each other." No 2-hop expansion and, crucially,
+    // NO diversity heuristic: we keep the Mcurmax closest candidates by raw
+    // distance (contrast buildTwoHop/Approx, which call getNeighborsByHeuristic2
+    // to prune for path coverage). Keeping the nearest-by-distance set leaves
+    // clustered/redundant edges and cannot rebuild the monotonic search path —
+    // deliberately the dumb baseline.
+    std::vector<tableint> buildNaiveReconstructionNeighborsLocked(
+        tableint source,
+        tableint deletedId,
+        int level,
+        int newLinkSize,
+        const std::unordered_set<tableint> &locked_nodes) {
+        (void) newLinkSize; (void) locked_nodes;
+        size_t Mcurmax = level ? maxM_ : maxM0_;
+        std::unordered_set<tableint> candidate_ids;
+
+        for (tableint neighbor : getConnectionsNoLock(source, level)) {
+            if (neighbor != deletedId && neighbor != source && !isMarkedDeleted(neighbor)) {
+                candidate_ids.emplace(neighbor);
+            }
+        }
+        // X's own neighbors: wire them to source ("neighbors to each other").
+        for (tableint sibling : getConnectionsNoLock(deletedId, level)) {
+            if (sibling != source && sibling != deletedId && !isMarkedDeleted(sibling)) {
+                candidate_ids.emplace(sibling);
+            }
+        }
+
+        std::vector<std::pair<dist_t, tableint>> scored;
+        scored.reserve(candidate_ids.size());
+        for (tableint candidate : candidate_ids) {
+            scored.emplace_back(
+                fstdistfunc_(getDataByInternalId(source), getDataByInternalId(candidate), dist_func_param_),
+                candidate);
+        }
+        // Dumb selection: nearest Mcurmax by distance, no diversity pruning.
+        std::sort(scored.begin(), scored.end(),
+                  [](const std::pair<dist_t, tableint> &a, const std::pair<dist_t, tableint> &b) {
+                      return a.first < b.first;
+                  });
+        std::vector<tableint> new_neighbors;
+        for (size_t i = 0; i < scored.size() && i < Mcurmax; i++) {
+            new_neighbors.emplace_back(scored[i].second);
         }
         return new_neighbors;
     }
@@ -2124,6 +2187,15 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             label_lookup_.erase(label);
         }
 
+        if (deleteModel == NAIVE_TOMBSTONE_DELETE) {
+            // Soft delete only: the node is already tombstoned (markDeletedInternal
+            // above) and its label removed. Leave its edges in place so it keeps
+            // routing; search filters it out. No repair, so no neighborhood locks.
+            // The entry point is intentionally NOT updated — a deleted node may
+            // remain the entry router, exactly as in stock hnswlib markDelete.
+            return;
+        }
+
         if (deleteModel == SEARCH_DELETE) {
             // Phase 1 (lock-free search) then Phase 2 (validated bounded commit).
             SearchRepairPlan plan = buildSearchRepairPlan(internalId, newLinkSize);
@@ -2157,6 +2229,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 std::vector<tableint> repaired_neighbors;
                 if (deleteModel == TWOHOP_DELETE) {
                     repaired_neighbors = buildTwoHopRepairNeighborsLocked(
+                        affected, internalId, level, newLinkSize, locked_node_set);
+                } else if (deleteModel == NAIVE_RECONSTRUCTION_DELETE) {
+                    repaired_neighbors = buildNaiveReconstructionNeighborsLocked(
                         affected, internalId, level, newLinkSize, locked_node_set);
                 } else {
                     repaired_neighbors = buildApproximateTwoHopRepairNeighborsLocked(

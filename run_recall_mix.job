@@ -1,0 +1,69 @@
+#!/bin/bash
+# =============================================================================
+# run_recall_mix.job — RECALL vs WRITE FRACTION for two-hop (3), approx (4),
+# and naive reconstruction (7). Produces one graph: recall vs write fraction, one
+# line per delete model. Runs at 40 threads. CPU-only.
+#
+#   sbatch run_recall_mix.job ; tail -f cwolverine-recallmix-<jobid>.out
+#
+# ef_search is held at a MODERATE value (EFS=40) on purpose: at ef=200 every
+# method pins at ~1.0 recall and the differences vanish. See recall_vs_mix.sh.
+# =============================================================================
+#SBATCH --job-name=cwolverine-recallmix
+#SBATCH --output=cwolverine-recallmix-%j.out
+#SBATCH --error=cwolverine-recallmix-%j.err
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --time=03:00:00
+#SBATCH --mem=32G
+#SBATCH --partition=batch
+#SBATCH --cpus-per-task=40
+#SBATCH --account=pod-users
+
+set -euo pipefail
+cd "${SLURM_SUBMIT_DIR:-.}"
+echo "Host: $(hostname)  CPUs: ${SLURM_CPUS_PER_TASK:-?}  Job: ${SLURM_JOB_ID:-n/a}"
+
+# --- compiler (same self-detect as the other jobs) --------------------------
+have_cxx17() { g++ -std=c++17 -x c++ -E - >/dev/null 2>&1 <<<'int main(){return 0;}'; }
+if ! command -v g++ >/dev/null 2>&1 || ! have_cxx17; then
+  if [ -n "${GCC_MODULE:-}" ]; then module load "$GCC_MODULE" 2>/dev/null || true
+  else for m in gcc gnu gcc-toolset/12 gcc/12 gcc/11 gcc/10 gcc/9; do module load "$m" 2>/dev/null && break || true; done
+  fi
+fi
+command -v g++ >/dev/null 2>&1 && have_cxx17 || { echo "ERROR: no C++17 g++" >&2; exit 1; }
+echo "Compiler: $(g++ --version | head -1)"
+
+# NUMA interleave across sockets (A/B with --export=ALL,NUMA_INTERLEAVE=0)
+if [ "${NUMA_INTERLEAVE:-1}" = "1" ] && command -v numactl >/dev/null 2>&1; then
+  export NUMACTL="numactl --interleave=all"; else export NUMACTL=""; fi
+echo "NUMA wrapper: '${NUMACTL:-<none>}'"
+
+make interleaved
+
+JID="${SLURM_JOB_ID:-local}"
+export MODELS="${MODELS:-3 4 7}"
+export WRITE_FRACS="${WRITE_FRACS:-0 20 40 60 80}"
+export THREADS="${THREADS:-40}"
+export INITIAL_ACTIVE="${INITIAL_ACTIVE:-10000}"
+export TOTAL_OPS="${TOTAL_OPS:-150000}"
+export REPEATS="${REPEATS:-5}"
+export EFS="${EFS:-40}"
+export VAL_QUERIES="${VAL_QUERIES:-500}"
+export OUT="recall_vs_mix_${JID}.csv"
+export RUNDIR="recall_vs_mix_runs_${JID}"
+
+echo "### recall vs write fraction  models=[$MODELS] fracs=[$WRITE_FRACS] ef=$EFS repeats=$REPEATS ###"
+bash ./recall_vs_mix.sh
+
+if command -v python3 >/dev/null 2>&1 && python3 -c "import matplotlib" 2>/dev/null; then
+  python3 plot_recall_vs_mix.py "$OUT" -o "recall_vs_mix_${JID}.png" \
+    --title "Recall vs write fraction (SIFT, ef_search=${EFS})" || true
+else
+  echo "(matplotlib missing — copy $OUT locally and run plot_recall_vs_mix.py)"
+fi
+
+echo; echo "================ results ===================="
+cat "$OUT"
+echo "============================================="
+echo "CSV: $OUT    PNG: recall_vs_mix_${JID}.png"
