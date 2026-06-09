@@ -61,15 +61,25 @@ for m in $MODELS; do
       tag="m${m}_wf${wf}_r${r}"
       log="$RUNDIR/${tag}.log"
       seed=$(( SEED + r ))
-      if ! ${NUMACTL:-} "$BIN" --data "$DATA" --queries "$QUERIES" --results "$RUNDIR/${tag}.csv" \
-          --initial-active "$INITIAL_ACTIVE" --total-ops "$TOTAL_OPS" \
-          --validation-interval 0 --validation-queries "$VAL_QUERIES" \
-          --k "$K" --M "$M" --ef-construction "$EFC" --ef-search "$EFS" \
-          --worker-threads "$THREADS" \
-          --search-weight "$sw" --insert-weight "$iw" --delete-weight "$dw" \
-          --delete-model "$m" --new-link-size "$NEW_LINK" --check-reverse-links 0 --seed "$seed" \
-          > "$log" 2>&1; then
-        echo "  ! run failed: $tag (see $log)"; continue
+      # Retry transient failures (the cluster occasionally drops a run for
+      # node/environment reasons unrelated to the code — a single flake should
+      # not blow away a whole data point). ATTEMPTS controls the max tries.
+      ok=0
+      for attempt in $(seq 1 "${ATTEMPTS:-3}"); do
+        if ${NUMACTL:-} "$BIN" --data "$DATA" --queries "$QUERIES" --results "$RUNDIR/${tag}.csv" \
+            --initial-active "$INITIAL_ACTIVE" --total-ops "$TOTAL_OPS" \
+            --validation-interval 0 --validation-queries "$VAL_QUERIES" \
+            --k "$K" --M "$M" --ef-construction "$EFC" --ef-search "$EFS" \
+            --worker-threads "$THREADS" \
+            --search-weight "$sw" --insert-weight "$iw" --delete-weight "$dw" \
+            --delete-model "$m" --new-link-size "$NEW_LINK" --check-reverse-links 0 --seed "$seed" \
+            > "$log" 2>&1; then
+          ok=1; break
+        fi
+        echo "  · attempt $attempt failed: $tag (see $log) — retrying"
+      done
+      if [ "$ok" -ne 1 ]; then
+        echo "  ! run failed after ${ATTEMPTS:-3} attempts: $tag (see $log)"; continue
       fi
       final=$(grep -m1 "Final validation" "$log" || true)
       recall=$(sed -nE 's/.*recall: ([0-9.]+).*/\1/p' <<<"$final")

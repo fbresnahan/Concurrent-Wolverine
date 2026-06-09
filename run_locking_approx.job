@@ -1,0 +1,96 @@
+#!/bin/bash
+# =============================================================================
+# run_locking_approx.job — FINE-GRAINED vs COARSE-GLOBAL-LOCK comparison for the
+# APPROXIMATE two-hop delete (model 4). Shows the speedup that fine-grained
+# locking buys over a single global mutex, for the approx-two-hop repair.
+#
+#   sbatch run_locking_approx.job
+#   tail -f cwolverine-lockapprox-<jobid>.out
+#
+# Produces two CSV/PNG pairs (model 4):
+#   sweep_results_<jid>_m4.*  — throughput vs thread count (80/10/10 mix)
+#   mix_results_<jid>_m4.*    — throughput vs workload mix  (all cores)
+# Each plots the fine-grained build against the -DCOARSE_GLOBAL_LOCK baseline.
+#
+# This is the same machinery as run_comparison.job, pinned to MODELS=4 so you
+# don't have to pass --export. CPU-only; do NOT request GPUs.
+# =============================================================================
+#SBATCH --job-name=cwolverine-lockapprox
+#SBATCH --output=cwolverine-lockapprox-%j.out
+#SBATCH --error=cwolverine-lockapprox-%j.err
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --time=03:00:00
+#SBATCH --mem=32G
+#SBATCH --partition=batch
+#SBATCH --cpus-per-task=40
+#SBATCH --account=pod-users
+
+set -euo pipefail
+cd "${SLURM_SUBMIT_DIR:-.}"
+echo "Host: $(hostname)  CPUs: ${SLURM_CPUS_PER_TASK:-?}  Job: ${SLURM_JOB_ID:-n/a}  Date: $(date)"
+
+# --- compiler self-detect (same as the other jobs) --------------------------
+have_cxx17() { g++ -std=c++17 -x c++ -E - >/dev/null 2>&1 <<<'int main(){return 0;}'; }
+if ! command -v g++ >/dev/null 2>&1 || ! have_cxx17; then
+  if [ -n "${GCC_MODULE:-}" ]; then module load "$GCC_MODULE" 2>/dev/null || true
+  else for m in gcc gnu gcc-toolset/12 gcc/12 gcc/11 gcc/10 gcc/9; do module load "$m" 2>/dev/null && break || true; done
+  fi
+fi
+command -v g++ >/dev/null 2>&1 && have_cxx17 || { echo "ERROR: no C++17 g++" >&2; exit 1; }
+echo "Compiler: $(g++ --version | head -1)"
+
+# --- NUMA interleave across sockets (A/B with --export=ALL,NUMA_INTERLEAVE=0) -
+if [ "${NUMA_INTERLEAVE:-1}" = "1" ] && command -v numactl >/dev/null 2>&1; then
+  export NUMACTL="numactl --interleave=all"; else export NUMACTL=""; fi
+echo "NUMA wrapper: '${NUMACTL:-<none>}'"
+
+# IMPORTANT: rebuild from scratch so a stale binary can't mask source changes.
+# `compare` builds BOTH the fine-grained binary and the -DCOARSE_GLOBAL_LOCK one.
+make clean
+make compare
+
+# --- thread list up to the allocated core count -----------------------------
+NCORES="${SLURM_CPUS_PER_TASK:-8}"
+LIST=""
+for t in 1 2 4 8 16 32 64 128; do [ "$t" -le "$NCORES" ] && LIST="$LIST $t"; done
+case " $LIST " in *" $NCORES "*) : ;; *) LIST="$LIST $NCORES" ;; esac
+export THREADS="$LIST"
+
+export REPEATS="${REPEATS:-3}"
+export IMPLS="${IMPLS:-fine coarse}"
+export MODELS="4"            # <-- approximate two-hop
+MTAG="4"
+JID="${SLURM_JOB_ID:-local}"
+
+# === Experiment 1: thread scaling (fixed 80/10/10 mix) ======================
+export SEARCH_W=80 INSERT_W=10 DELETE_W=10
+export INITIAL_ACTIVE="${INITIAL_ACTIVE:-60000}"
+export TOTAL_OPS="${TOTAL_OPS:-400000}"
+export OUT="sweep_results_${JID}_m${MTAG}.csv"
+echo "### Exp1: thread scaling  model=approx(4)  threads=[$THREADS] repeats=$REPEATS ###"
+bash ./sweep.sh
+
+# === Experiment 2: workload-mix sweep (all cores) ===========================
+export MIX_THREADS="$NCORES"
+export INITIAL_ACTIVE=20000
+export TOTAL_OPS=100000
+export OUT="mix_results_${JID}_m${MTAG}.csv"
+unset SEARCH_W INSERT_W DELETE_W
+echo "### Exp2: workload-mix sweep @ ${MIX_THREADS} threads  model=approx(4) repeats=$REPEATS ###"
+bash ./mix_sweep.sh
+
+# === plots ==================================================================
+if command -v python3 >/dev/null 2>&1 && python3 -c "import matplotlib" 2>/dev/null; then
+  python3 plot_sweep.py "sweep_results_${JID}_m${MTAG}.csv" -o "sweep_results_${JID}_m${MTAG}.png" || true
+  python3 plot_mix.py   "mix_results_${JID}_m${MTAG}.csv"   -o "mix_results_${JID}_m${MTAG}.png"   || true
+else
+  echo "(matplotlib missing — copy CSVs locally and run plot_sweep.py / plot_mix.py)"
+fi
+
+echo; echo "================ results (approx, model 4) ================"
+echo "--- thread scaling (fine vs coarse) ---"; cat "sweep_results_${JID}_m${MTAG}.csv"
+echo "--- workload mix (fine vs coarse) ---";   cat "mix_results_${JID}_m${MTAG}.csv"
+echo "=========================================================="
+echo "CSVs: sweep_results_${JID}_m4.csv  mix_results_${JID}_m4.csv"
+echo "PNGs: sweep_results_${JID}_m4.png  mix_results_${JID}_m4.png"

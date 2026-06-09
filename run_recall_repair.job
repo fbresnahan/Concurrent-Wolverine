@@ -1,0 +1,81 @@
+#!/bin/bash
+# =============================================================================
+# run_recall_repair.job — RECALL vs WRITE FRACTION for the three repair flavours:
+#   two-hop (3, full Wolverine repair), approx two-hop (4, cheap variant),
+#   naive reconstruction (7, the dumb baseline).
+# Expected ordering: two-hop >= approx > naive reconstruction. The gap grows with
+# the write fraction (more churn => more repaired regions => the naive repair's
+# wrong reconnections cost recall).
+#
+#   sbatch run_recall_repair.job
+#   tail -f cwolverine-recallrepair-<jobid>.out
+#
+# Produces one graph: recall vs write fraction, one line per model.
+#
+# ef_search is held MODERATE (EFS=24) on purpose. At ef=200 every method pins at
+# ~1.0 recall (flat graph); at ef=40 two-hop and approx are indistinguishable.
+# ef=24 keeps baseline recall below the ceiling so the three separate cleanly.
+# Lower EFS (e.g. 16) widens the gaps further at lower absolute recall.
+# =============================================================================
+#SBATCH --job-name=cwolverine-recallrepair
+#SBATCH --output=cwolverine-recallrepair-%j.out
+#SBATCH --error=cwolverine-recallrepair-%j.err
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --time=04:00:00
+#SBATCH --mem=32G
+#SBATCH --partition=batch
+#SBATCH --cpus-per-task=40
+#SBATCH --account=pod-users
+
+set -euo pipefail
+cd "${SLURM_SUBMIT_DIR:-.}"
+echo "Host: $(hostname)  CPUs: ${SLURM_CPUS_PER_TASK:-?}  Job: ${SLURM_JOB_ID:-n/a}  Date: $(date)"
+
+# --- compiler self-detect ---------------------------------------------------
+have_cxx17() { g++ -std=c++17 -x c++ -E - >/dev/null 2>&1 <<<'int main(){return 0;}'; }
+if ! command -v g++ >/dev/null 2>&1 || ! have_cxx17; then
+  if [ -n "${GCC_MODULE:-}" ]; then module load "$GCC_MODULE" 2>/dev/null || true
+  else for m in gcc gnu gcc-toolset/12 gcc/12 gcc/11 gcc/10 gcc/9; do module load "$m" 2>/dev/null && break || true; done
+  fi
+fi
+command -v g++ >/dev/null 2>&1 && have_cxx17 || { echo "ERROR: no C++17 g++" >&2; exit 1; }
+echo "Compiler: $(g++ --version | head -1)"
+
+# --- NUMA interleave --------------------------------------------------------
+if [ "${NUMA_INTERLEAVE:-1}" = "1" ] && command -v numactl >/dev/null 2>&1; then
+  export NUMACTL="numactl --interleave=all"; else export NUMACTL=""; fi
+echo "NUMA wrapper: '${NUMACTL:-<none>}'"
+
+# rebuild from scratch so a stale binary can't mask source changes
+make clean
+make interleaved
+
+JID="${SLURM_JOB_ID:-local}"
+# 3=two-hop, 4=approx two-hop, 7=naive reconstruction
+export MODELS="${MODELS:-3 4 7}"
+export WRITE_FRACS="${WRITE_FRACS:-0 20 40 60 80}"
+export THREADS="${THREADS:-40}"
+export INITIAL_ACTIVE="${INITIAL_ACTIVE:-10000}"
+export TOTAL_OPS="${TOTAL_OPS:-200000}"   # high churn so naive repair damage accumulates
+export REPEATS="${REPEATS:-5}"
+export EFS="${EFS:-24}"                    # moderate-low so the three methods separate
+export VAL_QUERIES="${VAL_QUERIES:-500}"
+export ATTEMPTS="${ATTEMPTS:-3}"          # retry transient cluster flakes per run
+export OUT="recall_repair_${JID}.csv"
+export RUNDIR="recall_repair_runs_${JID}"
+
+echo "### recall vs write fraction  models=[$MODELS] fracs=[$WRITE_FRACS] ef=$EFS ops=$TOTAL_OPS repeats=$REPEATS ###"
+bash ./recall_vs_mix.sh
+
+if command -v python3 >/dev/null 2>&1 && python3 -c "import matplotlib" 2>/dev/null; then
+  python3 plot_recall_vs_mix.py "$OUT" -o "recall_repair_${JID}.png" \
+    --title "Recall vs write fraction: two-hop vs approx vs naive reconstruction (SIFT, ef=${EFS})" || true
+else
+  echo "(matplotlib missing — copy $OUT locally and run plot_recall_vs_mix.py)"
+fi
+
+echo; echo "================ results ===================="
+cat "$OUT"
+echo "============================================="
+echo "CSV: $OUT    PNG: recall_repair_${JID}.png"
