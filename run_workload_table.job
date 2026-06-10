@@ -1,0 +1,69 @@
+#!/bin/bash
+# =============================================================================
+# run_workload_table.job — QPS + median search latency for three realistic
+# workloads, for a results table:
+#
+#   RAG / blob-storage search (read-heavy)   80/10/10
+#   E-commerce semantic search               70/15/15
+#   Real-time anomaly / fraud detection      50/25/25   (write-heavy)
+#
+#   sbatch run_workload_table.job
+#   tail -f cwolverine-wtab-<jobid>.out
+#
+# Uses the fine-grained concurrent index with two-hop repair (model 3) at 40
+# threads. Prints a table and writes workload_summary_<jid>.csv:
+#   workload, mix, search_qps, overall_ops_s, search_p50_ms, recall
+# CPU-only; do NOT request GPUs.
+# =============================================================================
+#SBATCH --job-name=cwolverine-wtab
+#SBATCH --output=cwolverine-wtab-%j.out
+#SBATCH --error=cwolverine-wtab-%j.err
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --time=04:00:00
+#SBATCH --mem=32G
+#SBATCH --partition=batch
+#SBATCH --cpus-per-task=40
+#SBATCH --account=pod-users
+
+set -euo pipefail
+cd "${SLURM_SUBMIT_DIR:-.}"
+echo "Host: $(hostname)  CPUs: ${SLURM_CPUS_PER_TASK:-?}  Job: ${SLURM_JOB_ID:-n/a}  Date: $(date)"
+
+# --- compiler self-detect ---------------------------------------------------
+have_cxx17() { g++ -std=c++17 -x c++ -E - >/dev/null 2>&1 <<<'int main(){return 0;}'; }
+if ! command -v g++ >/dev/null 2>&1 || ! have_cxx17; then
+  if [ -n "${GCC_MODULE:-}" ]; then module load "$GCC_MODULE" 2>/dev/null || true
+  else for m in gcc gnu gcc-toolset/12 gcc/12 gcc/11 gcc/10 gcc/9; do module load "$m" 2>/dev/null && break || true; done
+  fi
+fi
+command -v g++ >/dev/null 2>&1 && have_cxx17 || { echo "ERROR: no C++17 g++" >&2; exit 1; }
+echo "Compiler: $(g++ --version | head -1)"
+
+# --- NUMA interleave --------------------------------------------------------
+if [ "${NUMA_INTERLEAVE:-1}" = "1" ] && command -v numactl >/dev/null 2>&1; then
+  export NUMACTL="numactl --interleave=all"; else export NUMACTL=""; fi
+echo "NUMA wrapper: '${NUMACTL:-<none>}'"
+
+# rebuild from scratch so a stale binary can't mask source changes
+make clean
+make interleaved
+
+JID="${SLURM_JOB_ID:-local}"
+export THREADS="${THREADS:-40}"
+export REPEATS="${REPEATS:-5}"
+export DELETE_MODEL="${DELETE_MODEL:-3}"      # two-hop (Wolverine flagship)
+export INITIAL_ACTIVE="${INITIAL_ACTIVE:-40000}"
+export TOTAL_OPS="${TOTAL_OPS:-200000}"
+export EFS="${EFS:-200}"
+export SEED="${SEED:-100}"
+export OUT="workload_table_${JID}.csv"
+export TABLE="workload_summary_${JID}.csv"
+export RUNDIR="workload_runs_${JID}"
+
+echo "### workload table  threads=$THREADS model=$DELETE_MODEL ef=$EFS ops=$TOTAL_OPS repeats=$REPEATS ###"
+bash ./workload_table.sh
+
+echo
+echo "CSV (per-run): $OUT"
+echo "CSV (table):   $TABLE"

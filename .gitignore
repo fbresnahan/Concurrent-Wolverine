@@ -26,6 +26,9 @@ recall_repair*.csv
 recall_repair_runs*/
 latency_timeseries*.csv
 latency_timeseries_runs*/
+workload_table*.csv
+workload_summary*.csv
+workload_runs_*/
 sweep_results*.csv
 mix_results*.csv
 *.png
