@@ -1,0 +1,86 @@
+#!/bin/bash
+# =============================================================================
+# run_latency_timeseries.job — SEARCH LATENCY OVER TIME for two-hop (3),
+# approx (4), and naive tombstone (6). Shows tombstone's search latency drifting
+# UP as deletes accumulate (tombstoned nodes pile up in the graph), while two-hop
+# and approx remove dead nodes so their latency stays flat.
+#
+#   sbatch run_latency_timeseries.job
+#   tail -f cwolverine-latts-<jobid>.out
+#
+# Produces TWO plots from one CSV:
+#   latency_ts_time_<jid>.png     — x = elapsed time (s)        (as requested)
+#   latency_ts_deletes_<jid>.png  — x = cumulative deletes      (same scale for all
+#                                    models; clearer since tombstone's cheap deletes
+#                                    otherwise race ahead in wall-clock time)
+#
+# Delete-heavy mix (40/30/30) + long run so the tombstone graph grows large.
+# CPU-only; do NOT request GPUs.
+# =============================================================================
+#SBATCH --job-name=cwolverine-latts
+#SBATCH --output=cwolverine-latts-%j.out
+#SBATCH --error=cwolverine-latts-%j.err
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --time=04:00:00
+#SBATCH --mem=32G
+#SBATCH --partition=batch
+#SBATCH --cpus-per-task=40
+#SBATCH --account=pod-users
+
+set -euo pipefail
+cd "${SLURM_SUBMIT_DIR:-.}"
+echo "Host: $(hostname)  CPUs: ${SLURM_CPUS_PER_TASK:-?}  Job: ${SLURM_JOB_ID:-n/a}  Date: $(date)"
+
+# --- compiler self-detect ---------------------------------------------------
+have_cxx17() { g++ -std=c++17 -x c++ -E - >/dev/null 2>&1 <<<'int main(){return 0;}'; }
+if ! command -v g++ >/dev/null 2>&1 || ! have_cxx17; then
+  if [ -n "${GCC_MODULE:-}" ]; then module load "$GCC_MODULE" 2>/dev/null || true
+  else for m in gcc gnu gcc-toolset/12 gcc/12 gcc/11 gcc/10 gcc/9; do module load "$m" 2>/dev/null && break || true; done
+  fi
+fi
+command -v g++ >/dev/null 2>&1 && have_cxx17 || { echo "ERROR: no C++17 g++" >&2; exit 1; }
+echo "Compiler: $(g++ --version | head -1)"
+
+# --- NUMA interleave --------------------------------------------------------
+if [ "${NUMA_INTERLEAVE:-1}" = "1" ] && command -v numactl >/dev/null 2>&1; then
+  export NUMACTL="numactl --interleave=all"; else export NUMACTL=""; fi
+echo "NUMA wrapper: '${NUMACTL:-<none>}'"
+
+# rebuild from scratch so a stale binary can't mask source changes
+make clean
+make interleaved
+
+JID="${SLURM_JOB_ID:-local}"
+export MODELS="${MODELS:-3 4 6}"          # two-hop, approx, naive tombstone
+export THREADS="${THREADS:-40}"
+export INITIAL_ACTIVE="${INITIAL_ACTIVE:-10000}"
+export TOTAL_OPS="${TOTAL_OPS:-300000}"   # long run so tombstones accumulate
+export BUCKETS="${BUCKETS:-50}"
+export REPEATS="${REPEATS:-3}"
+export EFS="${EFS:-100}"                   # higher ef => dead-node traversal cost shows
+export SEARCH_W="${SEARCH_W:-40}"; export INSERT_W="${INSERT_W:-30}"; export DELETE_W="${DELETE_W:-30}"
+export ATTEMPTS="${ATTEMPTS:-3}"
+export OUT="latency_timeseries_${JID}.csv"
+export RUNDIR="latency_timeseries_runs_${JID}"
+
+echo "### search latency over time  models=[$MODELS] ops=$TOTAL_OPS ef=$EFS buckets=$BUCKETS repeats=$REPEATS ###"
+bash ./latency_timeseries.sh
+
+if command -v python3 >/dev/null 2>&1 && python3 -c "import matplotlib" 2>/dev/null; then
+  python3 plot_latency_timeseries.py "$OUT" --x time \
+    -o "latency_ts_time_${JID}.png" \
+    --title "Search p50 latency over time (SIFT, ef=${EFS}, mix ${SEARCH_W}/${INSERT_W}/${DELETE_W})" || true
+  python3 plot_latency_timeseries.py "$OUT" --x deletes \
+    -o "latency_ts_deletes_${JID}.png" \
+    --title "Search p50 latency vs cumulative deletes (SIFT, ef=${EFS})" || true
+else
+  echo "(matplotlib missing — copy $OUT locally and run plot_latency_timeseries.py)"
+fi
+
+echo; echo "================ results (head) ===================="
+head -20 "$OUT"
+echo "..."
+echo "==================================================="
+echo "CSV: $OUT"
+echo "PNGs: latency_ts_time_${JID}.png  latency_ts_deletes_${JID}.png"

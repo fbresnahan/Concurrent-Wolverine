@@ -22,6 +22,12 @@ recall_vs_mix*.csv
 recall_vs_mix_runs*/
 latency_vs_mix*.csv
 latency_vs_mix_runs*/
+recall_repair*.csv
+recall_repair_runs*/
+latency_timeseries*.csv
+latency_timeseries_runs*/
+sweep_results*.csv
+mix_results*.csv
 *.png
 cwolverine-*.out
 cwolverine-*.err

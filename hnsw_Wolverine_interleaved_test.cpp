@@ -43,6 +43,11 @@ struct Config {
     int new_link_size = 16;
     bool check_reverse_links = false;
     unsigned int seed = 100;
+    // Optional: write a per-bucket search-latency-over-time CSV (time vs latency).
+    // Used to show tombstone search latency drifting up as deletes accumulate,
+    // while two-hop / approx stay flat. Empty path disables it.
+    string timeseries_file;
+    size_t timeseries_buckets = 40;
 };
 
 struct ValidationRecord {
@@ -60,6 +65,10 @@ struct WorkerStats {
     vector<double> search_latencies_ms;
     vector<double> insert_latencies_ms;
     vector<double> delete_latencies_ms;
+    // Completion time (seconds since benchmark_start) paired index-for-index with
+    // the latency vectors above, for building latency-over-time series.
+    vector<double> search_time_s;
+    vector<double> delete_time_s;
     size_t search_ops = 0;
     size_t insert_ops = 0;
     size_t delete_ops = 0;
@@ -421,6 +430,10 @@ ParsedArgs parseArgs(int argc, char **argv) {
             parsed.config.check_reverse_links = (stoi(value) != 0);
         } else if (key == "--seed") {
             parsed.config.seed = static_cast<unsigned int>(stoul(value));
+        } else if (key == "--timeseries-file") {
+            parsed.config.timeseries_file = value;
+        } else if (key == "--timeseries-buckets") {
+            parsed.config.timeseries_buckets = stoull(value);
         } else {
             throw runtime_error("unknown argument: " + key);
         }
@@ -456,6 +469,64 @@ void printHelp(const char *program_name) {
     cout << "  --new-link-size N\n";
     cout << "  --check-reverse-links 0|1\n";
     cout << "  --seed N\n";
+    cout << "  --timeseries-file PATH (write per-bucket search-latency-over-time CSV)\n";
+    cout << "  --timeseries-buckets N (default 40)\n";
+}
+
+string deleteModelName(int m) {
+    switch (m) {
+        case 0: return "violent";
+        case 2: return "search";
+        case 3: return "two-hop";
+        case 4: return "approx";
+        case 6: return "naive-tombstone";
+        case 7: return "naive-reconstruction";
+        default: return "model" + to_string(m);
+    }
+}
+
+// Write a per-bucket "search latency over time" CSV: split the run's wall-clock
+// duration into equal buckets, and for each bucket report the p50/p95/mean of the
+// searches that completed in it, plus cumulative deletes so far. This makes the
+// tombstone story visible: as deletes accumulate the tombstone graph grows and
+// its search latency drifts up, while two-hop / approx (which remove dead nodes)
+// stay flat.
+void writeLatencyTimeseries(
+    const Config &config,
+    const vector<double> &search_time_s,
+    const vector<double> &search_latencies_ms,
+    const vector<double> &delete_time_s,
+    double total_elapsed_sec) {
+    if (config.timeseries_file.empty()) return;
+    size_t B = config.timeseries_buckets ? config.timeseries_buckets : 1;
+    double t_max = total_elapsed_sec > 0.0 ? total_elapsed_sec : 1e-9;
+    double width = t_max / static_cast<double>(B);
+
+    vector<vector<double>> buckets(B);
+    for (size_t i = 0; i < search_time_s.size() && i < search_latencies_ms.size(); i++) {
+        size_t b = static_cast<size_t>(search_time_s[i] / width);
+        if (b >= B) b = B - 1;
+        buckets[b].emplace_back(search_latencies_ms[i]);
+    }
+    vector<size_t> deletes_per_bucket(B, 0);
+    for (double t : delete_time_s) {
+        size_t b = static_cast<size_t>(t / width);
+        if (b >= B) b = B - 1;
+        deletes_per_bucket[b]++;
+    }
+
+    ofstream out(config.timeseries_file);
+    out << "model,model_name,bucket,t_mid_s,search_count,search_p50_ms,search_p95_ms,search_mean_ms,cum_deletes\n";
+    size_t cum_del = 0;
+    for (size_t b = 0; b < B; b++) {
+        cum_del += deletes_per_bucket[b];
+        double t_mid = (static_cast<double>(b) + 0.5) * width;
+        SummaryStats s = summarizeLatencies(buckets[b], 1.0);
+        out << config.delete_model << ',' << deleteModelName(config.delete_model) << ','
+            << b << ',' << fixed << setprecision(6) << t_mid << ','
+            << buckets[b].size() << ',' << s.p50_ms << ',' << s.p95_ms << ',' << s.mean_ms << ','
+            << cum_del << '\n';
+    }
 }
 
 void writeResultsCsv(
@@ -654,6 +725,8 @@ int main(int argc, char **argv) {
                 config.k);
             stats.search_ops++;
             stats.search_latencies_ms.emplace_back(elapsedMilliseconds(start));
+            stats.search_time_s.emplace_back(
+                chrono::duration<double>(chrono::steady_clock::now() - benchmark_start).count());
         } catch (...) {
             stats.search_failures++;
         }
@@ -700,6 +773,8 @@ int main(int argc, char **argv) {
             label_pool.commitDelete();
             stats.delete_ops++;
             stats.delete_latencies_ms.emplace_back(elapsedMilliseconds(start));
+            stats.delete_time_s.emplace_back(
+                chrono::duration<double>(chrono::steady_clock::now() - benchmark_start).count());
         } catch (...) {
             label_pool.revertDelete(label);
             stats.delete_failures++;
@@ -785,6 +860,14 @@ int main(int argc, char **argv) {
             totals.delete_latencies_ms.end(),
             stats.delete_latencies_ms.begin(),
             stats.delete_latencies_ms.end());
+        totals.search_time_s.insert(
+            totals.search_time_s.end(),
+            stats.search_time_s.begin(),
+            stats.search_time_s.end());
+        totals.delete_time_s.insert(
+            totals.delete_time_s.end(),
+            stats.delete_time_s.begin(),
+            stats.delete_time_s.end());
     }
 
     SummaryStats search_summary = summarizeLatencies(totals.search_latencies_ms, total_elapsed_sec);
@@ -825,6 +908,13 @@ int main(int argc, char **argv) {
         delete_summary,
         totals,
         final_record);
+
+    writeLatencyTimeseries(
+        config,
+        totals.search_time_s,
+        totals.search_latencies_ms,
+        totals.delete_time_s,
+        total_elapsed_sec);
 
     delete alg_hnsw;
     delete[] data;
